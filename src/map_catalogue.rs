@@ -14,13 +14,14 @@ pub(crate) struct Filter {
     mode: Option<i16>,
     source: Option<String>,
     status: Option<String>,
+    uploaded_only: Option<bool>,
     uploaded_by: Option<String>,
     sort: Option<String>,
 }
 
 // Both previews and the full set selector use the existing compact difficulty
 // shape. Package truth is carried only by the representative's public DTO.
-const DIFFICULTY: &str = "jsonb_build_object('id',b.id,'title',b.title,'artist',b.artist,'creator',b.creator,\
+const DIFFICULTY: &str = "jsonb_build_object('id',b.id,'native_id',b.native_id,'title',b.title,'artist',b.artist,'creator',b.creator,\
     'version',b.version,'mode',b.mode,'status',b.status,'source',b.source,'stars',b.stars,\
     'length_seconds',b.length_seconds,'bpm',b.bpm,'max_combo',b.max_combo)";
 
@@ -38,11 +39,12 @@ pub(crate) async fn list(State(state): State<AppState>, Query(filter): Query<Fil
     {
         return Err(ApiError::bad("Unknown source filter."));
     }
-    if filter
-        .status
-        .as_deref()
-        .is_some_and(|status| !matches!(status, "pending" | "ranked" | "loved" | "unranked"))
-    {
+    if filter.status.as_deref().is_some_and(|status| {
+        !matches!(
+            status,
+            "graveyard" | "wip" | "pending" | "ranked" | "loved" | "unranked"
+        )
+    }) {
         return Err(ApiError::bad("Unknown status filter."));
     }
     let uploader = filter
@@ -82,6 +84,9 @@ pub(crate) async fn list(State(state): State<AppState>, Query(filter): Query<Fil
                 AND ($3::text IS NULL OR b.source=$3)
                 AND ($4::text IS NULL OR b.status=$4)
                 AND ($5::bigint IS NULL OR b.uploaded_by=$5)
+                AND (NOT $8::boolean OR (b.source='local' AND b.official_id IS NULL
+                    AND b.official_set_id IS NULL AND b.uploaded_by IS NOT NULL
+                    AND b.native_set_id>=2000000000))
         ), grouped AS (
             SELECT native_set_id,min(id) AS representative_id,count(*) AS matching_count,
                 array_agg(DISTINCT mode ORDER BY mode) AS matching_modes,
@@ -127,6 +132,7 @@ pub(crate) async fn list(State(state): State<AppState>, Query(filter): Query<Fil
         .bind(uploader)
         .bind(size)
         .bind(offset)
+        .bind(filter.uploaded_only.unwrap_or(false))
         .fetch_one(&state.db)
         .await?;
     let items: Value = row.try_get("items")?;

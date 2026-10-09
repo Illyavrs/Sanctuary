@@ -13,6 +13,7 @@ use tower::ServiceExt;
 
 struct Seed<'a> {
     index: i64,
+    official_id: Option<i64>,
     set: Option<i64>,
     title: &'a str,
     version: &'a str,
@@ -28,6 +29,7 @@ impl Seed<'static> {
     fn official(index: i64, set: i64) -> Self {
         Self {
             index,
+            official_id: Some(100_000 + index),
             set: Some(set),
             title: "Same Fixture Song",
             version: "Easy",
@@ -43,6 +45,7 @@ impl Seed<'static> {
     fn local(index: i64) -> Self {
         Self {
             set: None,
+            official_id: None,
             source: "local",
             ..Self::official(index, 1)
         }
@@ -50,7 +53,7 @@ impl Seed<'static> {
 }
 async fn seed(state: &AppState, map: Seed<'_>) -> i64 {
     sqlx::query_scalar("INSERT INTO beatmaps(official_id,official_set_id,uploaded_by,title,artist,creator,version,mode,status,source,stars,length_seconds,bpm,max_combo,md5,osu_path,created_at) VALUES($1,$2,$3,$4,'Fixture Artist','Fixture Creator',$5,$6,$7,$8,$9,$10,120,42,$11,$12,$13::timestamptz) RETURNING id")
-        .bind(map.set.map(|_| 100_000 + map.index)).bind(map.set).bind(map.uploader)
+        .bind(map.official_id).bind(map.set).bind(map.uploader)
         .bind(map.title).bind(map.version).bind(map.mode).bind(map.status).bind(map.source)
         .bind(map.stars).bind(map.length).bind(format!("{:032x}",map.index))
         .bind(format!("private-fixture-{}.osu",map.index))
@@ -130,6 +133,7 @@ fn assert_difficulty(value: &Value) {
         value,
         &[
             "id",
+            "native_id",
             "title",
             "artist",
             "creator",
@@ -143,6 +147,7 @@ fn assert_difficulty(value: &Value) {
             "max_combo",
         ],
     );
+    assert!(value["native_id"].as_i64().is_some_and(|id| id > 0));
 }
 fn assert_public_map(value: &Value) {
     assert!(value.get("osu_path").is_none());
@@ -231,6 +236,136 @@ async fn catalogue_groups_only_canonical_sets_and_counts_empty_pages() {
             1,
         );
         assert_eq!(snapshot(&state).await, before);
+    })
+    .await;
+    fixture.finish(result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; owned disposable PostgreSQL 17"]
+async fn catalogue_uploaded_only_filters_identity_before_sorting_and_paging() {
+    let fixture = MutationFixture::new("catalogue_uploaded", "http://127.0.0.1:1".into()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result = tokio::spawn(async move {
+        let (owner, _, _, _) = actor(&state, "CatalogueLocalOwner", &[]).await;
+        let mut uploaded = Vec::new();
+        for (index, created, status) in [
+            (1, "2026-01-01T00:00:00Z", "ranked"),
+            (2, "2026-02-01T00:00:00Z", "pending"),
+            (3, "2026-03-01T00:00:00Z", "graveyard"),
+        ] {
+            let mut map = Seed::local(index);
+            map.uploader = Some(owner);
+            map.created = created;
+            map.status = status;
+            uploaded.push(native_set(&state, seed(&state, map).await).await);
+        }
+        assert!(uploaded.iter().all(|id| *id >= 2_000_000_000));
+
+        let mut withdrawn = Seed::local(4);
+        withdrawn.uploader = Some(owner);
+        withdrawn.created = "2026-12-31T00:00:00Z";
+        let withdrawn_set = native_set(&state, seed(&state, withdrawn).await).await;
+        sqlx::query("INSERT INTO beatmapset_availability(native_set_id,withdrawn,revision,reason,actor_id) VALUES($1,true,1,'Private uploaded catalogue withdrawal',$2)")
+            .bind(withdrawn_set).bind(owner).execute(&state.db).await.unwrap();
+
+        let mut official = Seed::official(5, 500);
+        official.uploader = Some(owner);
+        official.created = "2026-12-30T00:00:00Z";
+        seed(&state, official).await;
+        let mut legacy_official = Seed::official(6, 600);
+        legacy_official.source = "local";
+        legacy_official.uploader = Some(owner);
+        legacy_official.created = "2026-12-29T00:00:00Z";
+        seed(&state, legacy_official).await;
+        let mut orphan = Seed::local(7);
+        orphan.created = "2026-12-28T00:00:00Z";
+        let orphan_set = native_set(&state, seed(&state, orphan).await).await;
+        let mut official_id_only = Seed::local(8);
+        official_id_only.official_id = Some(100_008);
+        official_id_only.uploader = Some(owner);
+        official_id_only.created = "2026-12-27T00:00:00Z";
+        let official_id_only_set =
+            native_set(&state, seed(&state, official_id_only).await).await;
+        let mut official_set_only = Seed::official(9, 900);
+        official_set_only.official_id = None;
+        official_set_only.source = "local";
+        official_set_only.uploader = Some(owner);
+        official_set_only.created = "2026-12-26T00:00:00Z";
+        seed(&state, official_set_only).await;
+        let mut official_label_only = Seed::local(10);
+        official_label_only.source = "official";
+        official_label_only.uploader = Some(owner);
+        official_label_only.created = "2026-12-25T00:00:00Z";
+        seed(&state, official_label_only).await;
+
+        let before = snapshot(&state).await;
+        let upstream_before = state.official.lock().await.metadata_cache_shape();
+        let expected = vec![uploaded[2], uploaded[1], uploaded[0]];
+        let page = catalogue(
+            &app,
+            &[("uploaded_only", "true"), ("sort", "recent"), ("page_size", "3")],
+        )
+        .await;
+        assert_page(&page, &expected, "native_set_id", 3, 1, 3);
+        for item in page["items"].as_array().unwrap() {
+            let representative = &item["representative"];
+            assert_eq!(representative["source"], "local");
+            assert_eq!(representative["uploaded_by"], owner);
+            assert_eq!(representative["official_id"], Value::Null);
+            assert_eq!(representative["official_set_id"], Value::Null);
+        }
+        assert_page(
+            &catalogue(
+                &app,
+                &[("uploaded_only", "true"), ("page_size", "3"), ("page", "2")],
+            )
+            .await,
+            &[],
+            "native_set_id",
+            3,
+            2,
+            3,
+        );
+        assert_page(
+            &catalogue(&app, &[("uploaded_only", "true"), ("status", "graveyard")]).await,
+            &[uploaded[2]],
+            "native_set_id",
+            1,
+            1,
+            24,
+        );
+        assert_eq!(
+            catalogue(&app, &[("uploaded_only", "true"), ("source", "official")]).await
+                ["total"],
+            0,
+        );
+        let broad = catalogue(&app, &[("source", "local"), ("page_size", "3")]).await;
+        assert_page(
+            &broad,
+            &[600, orphan_set, official_id_only_set],
+            "native_set_id",
+            7,
+            1,
+            3,
+        );
+        assert_eq!(
+            catalogue(
+                &app,
+                &[("source", "local"), ("page_size", "3"), ("uploaded_only", "false")],
+            )
+            .await,
+            broad,
+            "explicit false preserves the legacy source filter",
+        );
+        assert_eq!(
+            catalogue(&app, &[("uploaded_only", "false")]).await,
+            catalogue(&app, &[]).await,
+            "unset and false preserve existing discovery",
+        );
+        assert_eq!(snapshot(&state).await, before);
+        assert_eq!(state.official.lock().await.metadata_cache_shape(), upstream_before);
     })
     .await;
     fixture.finish(result).await;
@@ -491,6 +626,7 @@ async fn catalogue_rejects_invalid_filters_and_bounds_utf8_bytes() {
     let result = tokio::spawn(async move {
         seed(&state, Seed::official(1, 800)).await;
         let before = snapshot(&state).await;
+        assert_eq!(catalogue(&app, &[("status", "wip")]).await["total"], 0);
         for (field, value) in [
             ("mode", "-1"),
             ("mode", "4"),
@@ -526,6 +662,10 @@ async fn catalogue_rejects_invalid_filters_and_bounds_utf8_bytes() {
             ("mode", "32768"),
             ("page", "-1"),
             ("page_size", "4294967296"),
+            ("uploaded_only", "1"),
+            ("uploaded_only", "TRUE"),
+            ("uploaded_only", ""),
+            ("uploaded_only", "yes"),
         ] {
             assert_eq!(
                 get(&app, &path("/api/v1/beatmapsets", &[(field, value)]), None)

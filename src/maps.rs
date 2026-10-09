@@ -29,7 +29,9 @@ mod official_set_metadata;
 pub use official_set_metadata::metadata;
 #[path = "official_search.rs"]
 mod official_search;
+pub use official_search::native_search;
 pub use official_search::search as search_official;
+pub(crate) use official_search::staff_detail as official_staff_detail;
 pub use official_search::{browse as browse_official, detail as official_detail};
 #[path = "map_card_preview.rs"]
 mod map_card_preview;
@@ -118,6 +120,8 @@ fn filename_conflict() -> ApiError {
 }
 
 pub(crate) const PUBLIC_MAP: &str = r#"to_jsonb(b)-'osu_path'-'archive_path' || jsonb_build_object(
+    'status_override_revision',COALESCE((SELECT revision FROM beatmap_status_overrides so
+        WHERE so.native_id=b.native_id AND so.native_set_id=b.native_set_id),0),
     'play_count',(SELECT count(*) FROM scores s WHERE s.beatmap_id=b.id AND verification='verified'),
     'download_url','/api/v1/beatmaps/'||b.id||'/download',
     'download_kind',CASE WHEN EXISTS(SELECT 1 FROM official_beatmapset_archive_members am WHERE am.beatmap_id=b.id)
@@ -274,6 +278,14 @@ pub async fn admin_list(
 async fn list_inner(state: &AppState, filter: Filter, admin: bool) -> ApiResult {
     if filter.q.as_ref().is_some_and(|v| v.len() > 100) {
         return Err(ApiError::bad("Search is too long."));
+    }
+    if filter.status.as_deref().is_some_and(|status| {
+        !matches!(
+            status,
+            "pending" | "wip" | "graveyard" | "ranked" | "loved" | "unranked"
+        )
+    }) {
+        return Err(ApiError::bad("Unknown beatmap status."));
     }
     let uploaded_by = uploader_filter(filter.uploaded_by.as_deref())?;
     let (p, size, offset) = Pagination {
@@ -1014,7 +1026,7 @@ pub async fn upload(
         for input in &parsed {
             let UploadMap { filename, map } = input;
             let path = format!("{package}/{}.osu", map.md5);
-            let id:i64=sqlx::query_scalar("INSERT INTO beatmaps(uploaded_by,title,artist,creator,version,mode,stars,bpm,length_seconds,max_combo,md5,osu_path,archive_path,local_package_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id").bind(actor.id).bind(&map.title).bind(&map.artist).bind(&map.creator).bind(&map.version).bind(map.mode).bind(map.stars).bind(map.bpm).bind(map.length).bind(map.max_combo).bind(&map.md5).bind(path).bind(&archive_path).bind(package_id).fetch_one(&mut *tx).await.map_err(package_write_error)?;
+            let id:i64=sqlx::query_scalar("INSERT INTO beatmaps(uploaded_by,title,artist,creator,version,mode,stars,bpm,length_seconds,max_combo,md5,osu_path,archive_path,local_package_id,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'graveyard') RETURNING id").bind(actor.id).bind(&map.title).bind(&map.artist).bind(&map.creator).bind(&map.version).bind(map.mode).bind(map.stars).bind(map.bpm).bind(map.length).bind(map.max_combo).bind(&map.md5).bind(path).bind(&archive_path).bind(package_id).fetch_one(&mut *tx).await.map_err(package_write_error)?;
             sqlx::query("INSERT INTO beatmap_filename_aliases(filename,beatmap_id) VALUES($1,$2)")
                 .bind(filename).bind(id).execute(&mut *tx).await?;
             ids.push(id);

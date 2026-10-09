@@ -43,6 +43,7 @@ mod profile_presentation_tests;
 mod rank_history;
 #[cfg(test)]
 mod rank_history_tests;
+mod rank_requests;
 #[cfg(test)]
 mod rbac_tests;
 #[cfg(test)]
@@ -338,6 +339,7 @@ fn router(state: AppState) -> Router {
             axum::http::Method::DELETE,
         ]);
     Router::new()
+        .merge(rank_requests::routes())
         .route(
             "/health/live",
             get(|| async { Json(json!({"status":"ok","service":"sanctuary"})) }),
@@ -494,6 +496,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v1/internal/beatmapsets/metadata",
             post(maps::metadata).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/api/v1/internal/beatmapsets/search",
+            post(maps::native_search).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/v1/leaderboard", get(scores::leaderboard))
         .route("/api/v1/channels", get(chat::channels))

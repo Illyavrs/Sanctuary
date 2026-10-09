@@ -223,7 +223,7 @@ async fn withdrawal_preserves_history_bytes_identity_and_restores_active_pp() {
         let uploaded=upload(&app,&cookie,"Availability lifecycle").await;let id=uploaded["items"][0]["id"].as_i64().unwrap();let set=uploaded["items"][0]["native_set_id"].as_i64().unwrap();
         let original=sqlx::query("SELECT md5,native_id,native_set_id,osu_path,local_package_id FROM beatmaps WHERE id=$1").bind(id).fetch_one(&state.db).await.unwrap();
         let path:String=original.get("osu_path");let bytes=tokio::fs::read(state.maps_root.join(&path)).await.unwrap();let files=file_count(&state.maps_root).await;
-        assert_eq!(request(&app,"PATCH",&format!("/api/v1/admin/beatmaps/{id}"),Some(&cookie),json!({"status":"ranked"})).await.0,StatusCode::OK);
+        assert_eq!(request(&app,"PATCH",&format!("/api/v1/admin/beatmaps/{id}"),Some(&cookie),json!({"status":"ranked","expected_revision":0,"expected_status_revision":0})).await.0,StatusCode::OK);
         let score:i64=sqlx::query_scalar("INSERT INTO scores(user_id,beatmap_id,mode,score,accuracy,max_combo,mods,pp,passed,hit_counts,client,verification,pp_eligible,standardised_score,classic_score,score_scale_status,replay_path,ingestion_key) VALUES($1,$2,0,123,100,2,0,200,true,'{\"n300\":2}','stable','verified',true,500000,500000,'legacy_estimated','kept.osr','availability-saved') RETURNING id").bind(owner).bind(id).fetch_one(&state.db).await.unwrap();
         tokio::fs::write(state.replay_root.join("kept.osr"),b"retained immutable replay fixture").await.unwrap();
         let profile=format!("/api/v1/users/{owner}");let best=format!("/api/v1/users/{owner}/scores/best");
@@ -237,7 +237,7 @@ async fn withdrawal_preserves_history_bytes_identity_and_restores_active_pp() {
         assert_eq!(request(&app,"GET","/api/v1/admin/beatmaps",Some(&cookie),Value::Null).await.1["total"],0);
         let retained=request(&app,"GET","/api/v1/admin/beatmaps?availability=withdrawn",Some(&cookie),Value::Null).await.1;assert_eq!(retained["total"],1);assert_eq!(retained["items"][0]["availability"]["reason"],"Package review");
         let retained=request(&app,"GET",&format!("/api/v1/admin/beatmaps/{id}"),Some(&cookie),Value::Null).await;assert_eq!(retained.0,StatusCode::OK);assert_eq!(retained.1["availability"]["withdrawn"],true);
-        let changed=request(&app,"PATCH",&format!("/api/v1/admin/beatmaps/{id}"),Some(&cookie),json!({"status":"loved"})).await;assert_eq!(changed.0,StatusCode::OK);assert_eq!(changed.1["availability"]["withdrawn"],true);
+        let changed=request(&app,"PATCH",&format!("/api/v1/admin/beatmaps/{id}"),Some(&cookie),json!({"status":"loved","expected_revision":1,"expected_status_revision":1})).await;assert_eq!(changed.0,StatusCode::GONE);assert_eq!(changed.1["error"]["code"],"beatmap_withdrawn");
         assert_eq!(request(&app,"GET",&best,None,Value::Null).await.1["total"],0);
         let stats=request(&app,"GET",&profile,None,Value::Null).await.1;assert_eq!(stats["statistics"]["pp"],0.0);assert_eq!(stats["statistics"]["play_count"],1);
         let history=request(&app,"GET",&format!("/api/v1/scores/{score}"),None,Value::Null).await;assert_eq!(history.0,StatusCode::OK);assert_eq!(history.1["has_replay"],true);
@@ -247,8 +247,8 @@ async fn withdrawal_preserves_history_bytes_identity_and_restores_active_pp() {
         for field in ["md5","osu_path"] {assert_eq!(current.get::<String,_>(field),original.get::<String,_>(field));}
         for field in ["native_id","native_set_id"] {assert_eq!(current.get::<i64,_>(field),original.get::<i64,_>(field));}
         assert_eq!(current.get::<uuid::Uuid,_>("local_package_id"),original.get::<uuid::Uuid,_>("local_package_id"));
-        assert_eq!(request(&app,"PATCH",&format!("/api/v1/admin/beatmaps/{id}"),Some(&cookie),json!({"status":"ranked"})).await.0,StatusCode::OK);
         assert_eq!(change(&app,&cookie,set,false,1,"Review complete").await.0,StatusCode::OK);
+        assert_eq!(request(&app,"PATCH",&format!("/api/v1/admin/beatmaps/{id}"),Some(&cookie),json!({"status":"ranked","expected_revision":1,"expected_status_revision":1})).await.0,StatusCode::OK);
         let public=request(&app,"GET",&format!("/api/v1/beatmaps/{id}"),None,Value::Null).await;assert_eq!(public.0,StatusCode::OK);assert!(public.1["availability"].get("reason").is_none());assert!(public.1["availability"].get("actor_id").is_none());
         assert_eq!(request(&app,"GET",&best,None,Value::Null).await.1["total"],1);assert_eq!(request(&app,"GET",&profile,None,Value::Null).await.1["statistics"]["pp"],200.0);
     }).await;

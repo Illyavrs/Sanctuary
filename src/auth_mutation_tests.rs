@@ -428,9 +428,9 @@ async fn auth_mutation_guards_and_queued_writes() {
             .bind(sid).fetch_one(&pool).await.unwrap();
         let admin_app = router(state.clone());
         let queued = tokio::spawn(async move {
-            request(&admin_app, Method::PATCH, &format!("/api/v1/admin/beatmaps/{map_id}"), &token, Some(json!({"status":"ranked"}))).await
+            request(&admin_app, Method::PATCH, &format!("/api/v1/admin/beatmaps/{map_id}"), &token, Some(json!({"status":"ranked","expected_revision":0,"expected_status_revision":0}))).await
         });
-        wait_for_lock(&pool, &application, "UPDATE beatmaps SET status=$2 WHERE id=$1", 1).await;
+        wait_for_lock(&pool, &application, "SELECT id,native_id,native_set_id,md5,status,status_revision,source,uploaded_by FROM beatmaps WHERE native_id=$1 AND native_set_id=$2 FOR UPDATE", 1).await;
         wait_until_expired(&pool, expires).await;
         blocking.commit().await.unwrap();
         let (status, value) = tokio::time::timeout(StdDuration::from_secs(5), queued).await.unwrap().unwrap();

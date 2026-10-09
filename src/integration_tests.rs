@@ -516,7 +516,7 @@ async fn persistence_and_permissions() {
     .await;
     assert_eq!(s, StatusCode::OK, "{maps}");
     let map_id = maps["items"][0]["id"].as_i64().unwrap();
-    assert_eq!(maps["items"][0]["status"], "pending");
+    assert_eq!(maps["items"][0]["status"], "graveyard");
     let (s, _, public_map) = request(
         &app,
         Method::GET,
@@ -703,7 +703,7 @@ async fn persistence_and_permissions() {
         Method::PATCH,
         &format!("/api/v1/admin/beatmaps/{map_id}"),
         Some(&cookie),
-        Some(json!({"status":"ranked"})),
+        Some(json!({"status":"ranked","expected_revision":0,"expected_status_revision":0})),
     )
     .await;
     assert_eq!(s, StatusCode::OK);

@@ -150,7 +150,7 @@ async fn scoped_rbac_privacy_deletion_revocation_and_queued_authorization() {
         let app = router(state.clone());
         let admin = user(&pool, "RbacAdmin", &[3]).await;
         let (_, admin_cookie) = session(&state, admin).await;
-        let manager_role = role(&pool, "limited_manager", &["roles.manage", "users.sessions.revoke", "chat.send", "social.manage", "beatmaps.upload", "beatmaps.moderate", "scores.moderate"]).await;
+        let manager_role = role(&pool, "limited_manager", &["roles.manage", "users.sessions.revoke", "chat.send", "social.manage", "beatmaps.upload", "beatmaps.moderate", "scores.moderate", "beatmaps.rank.request"]).await;
         let manager = user(&pool, "RbacManager", &[manager_role]).await;
         let (_, manager_cookie) = session(&state, manager).await;
         let target = user(&pool, "RbacTarget", &[1]).await;
@@ -314,7 +314,7 @@ async fn scoped_rbac_privacy_deletion_revocation_and_queued_authorization() {
             (Method::DELETE, format!("/api/v1/admin/roles/{queued_role}"), None),
             (Method::PATCH, format!("/api/v1/admin/users/{target}"), Some(json!({"roles":[]}))),
             (Method::POST, format!("/api/v1/admin/users/{target}/sessions/revoke"), None),
-            (Method::PATCH, "/api/v1/admin/beatmaps/1".to_string(), Some(json!({"status":"ranked"}))),
+            (Method::PATCH, "/api/v1/admin/beatmaps/1".to_string(), Some(json!({"status":"ranked","expected_revision":0,"expected_status_revision":0}))),
             (Method::PATCH, "/api/v1/admin/scores/1".to_string(), Some(json!({"verification":"verified","expected_revision":0}))),
             (Method::POST, "/api/v1/admin/scores/recalculate-relax".to_string(), Some(json!({"score_ids":[1]}))),
         ];

@@ -141,7 +141,11 @@ async fn retain_administrator(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) ->
 }
 
 fn builtin_role(id: i64, name: &str) -> bool {
-    (1..=3).contains(&id) || matches!(name, "player" | "moderator" | "administrator")
+    (1..=3).contains(&id)
+        || matches!(
+            name,
+            "player" | "moderator" | "administrator" | "beatmap_nominator"
+        )
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -473,8 +477,11 @@ mod tests {
     }
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MapPatch {
     status: String,
+    expected_revision: i64,
+    expected_status_revision: i64,
 }
 pub async fn update_map(
     State(state): State<AppState>,
@@ -486,22 +493,50 @@ pub async fn update_map(
     user.require("beatmaps.moderate")?;
     if !matches!(
         input.status.as_str(),
-        "pending" | "ranked" | "loved" | "unranked"
+        "pending" | "ranked" | "loved" | "unranked" | "graveyard" | "wip"
     ) {
         return Err(ApiError::bad("Unknown beatmap status."));
+    }
+    if input.expected_revision < 0 || input.expected_status_revision < 0 {
+        return Err(ApiError::bad("Supply non-negative difficulty revisions."));
     }
     let mut tx = state.db.begin().await?;
     let user = lock_actor(&mut tx, &user, None).await?;
     user.require("beatmaps.moderate")?;
-    let result = sqlx::query("UPDATE beatmaps SET status=$2 WHERE id=$1")
+    let identity = sqlx::query("SELECT native_id,native_set_id FROM beatmaps WHERE id=$1")
         .bind(id)
-        .bind(&input.status)
-        .execute(&mut *tx)
-        .await?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::missing());
-    }
-    sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'beatmaps.status','beatmap',$2,$3)").bind(user.id).bind(id.to_string()).bind(json!({"status":input.status})).execute(&mut *tx).await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::missing)?;
+    use sqlx::Row;
+    let set_id: i64 = identity.get("native_set_id");
+    crate::beatmap_availability::lock_exclusive_set(&mut tx, set_id).await?;
+    crate::beatmap_availability::lock_active_set(&mut tx, set_id).await?;
+    let row = crate::rank_requests::locked_difficulty(&mut tx, set_id, identity.get("native_id"))
+        .await?
+        .ok_or_else(ApiError::missing)?;
+    crate::rank_requests::check_difficulty_revision(
+        &mut tx,
+        set_id,
+        &crate::rank_requests::DifficultyRevision::new(
+            row.get("native_id"),
+            input.expected_revision,
+            Some(input.expected_status_revision),
+        ),
+        Some(&row),
+    )
+    .await?;
+    auth::ensure_mutation_actor(&mut tx, &user).await?;
+    crate::rank_requests::set_difficulty_status(
+        &mut tx,
+        &user,
+        set_id,
+        row.get("native_id"),
+        &input.status,
+        "Direct staff difficulty status change",
+        Some(&row),
+    )
+    .await?;
     auth::ensure_mutation_actor(&mut tx, &user).await?;
     tx.commit().await?;
     Ok(Json(crate::maps::get_retained(&state, id).await?))

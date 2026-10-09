@@ -9,6 +9,266 @@ use axum::{
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tower::ServiceExt;
 
+#[test]
+fn official_search_native_filters_share_equivalent_keys_and_encode_cursors() {
+    assert_eq!(
+        native_parse("s=ranked&nsfw=false&m=all").unwrap(),
+        parse(None).unwrap()
+    );
+    assert_eq!(
+        native_parse("s=ranked&sort=updated_desc").unwrap(),
+        parse(Some("sort=date_desc".into())).unwrap()
+    );
+    let raw = query(&[
+        ("q", "歌 & 星"),
+        ("m", "3"),
+        ("s", "leaderboard"),
+        ("sort", "artist_asc"),
+        ("c", "spotlights.featured_artists"),
+        ("e", "video.storyboard"),
+        ("g", "5"),
+        ("l", "3"),
+        ("nsfw", "true"),
+        ("cursor[artist.raw]", "A & 歌"),
+        ("cursor[id]", "42"),
+    ]);
+    let key = native_parse(&raw).unwrap();
+    let url = reqwest::Url::parse(&format!("https://osu.ppy.sh{}", key.path())).unwrap();
+    assert_eq!(url.host_str(), Some("osu.ppy.sh"));
+    assert_eq!(url.path(), "/api/v2/beatmapsets/search");
+    let fields = url.query_pairs().collect::<HashMap<_, _>>();
+    assert_eq!(fields["q"], "歌 & 星");
+    assert_eq!(fields["m"], "3");
+    assert_eq!(fields["s"], "leaderboard");
+    assert_eq!(fields["sort"], "artist_asc");
+    assert_eq!(fields["c"], "featured_artists.spotlights");
+    assert_eq!(fields["e"], "storyboard.video");
+    assert_eq!(fields["cursor[artist.raw]"], "A & 歌");
+    assert_eq!(fields["cursor[id]"], "42");
+    assert_eq!(fields["nsfw"], "true");
+    assert_eq!(
+        url.query_pairs().filter(|(name, _)| name == "nsfw").count(),
+        1
+    );
+    for key in [
+        parse(None).unwrap(),
+        native_parse("nsfw=false&s=ranked").unwrap(),
+    ] {
+        let url = reqwest::Url::parse(&format!("https://osu.ppy.sh{}", key.path())).unwrap();
+        assert_eq!(
+            url.query_pairs()
+                .filter(|(name, _)| name == "nsfw")
+                .map(|(_, value)| value.to_string())
+                .collect::<Vec<_>>(),
+            ["false"]
+        );
+    }
+    assert_eq!(
+        native_parse("c=featured_artists.spotlights").unwrap(),
+        native_parse("c=spotlights.featured_artists").unwrap()
+    );
+    for field in [
+        "title",
+        "artist",
+        "difficulty",
+        "updated",
+        "ranked",
+        "rating",
+        "plays",
+        "favourites",
+        "relevance",
+        "nominations",
+    ] {
+        for order in ["asc", "desc"] {
+            assert!(native_parse(&format!("sort={field}_{order}")).is_ok());
+        }
+    }
+}
+
+#[test]
+fn official_search_native_rejects_personal_unknown_duplicate_and_unbounded_filters() {
+    for raw in [
+        "s=favourites",
+        "s=mine",
+        "played=played",
+        "played=unplayed",
+        "r=XH.S",
+        "c=follows",
+        "c=recommended.featured_artists",
+    ] {
+        let error = native_parse(raw).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST, "{raw}");
+        assert_eq!(error.1, "unsupported_search_filter", "{raw}");
+    }
+    for raw in [
+        "m=4",
+        "s=approved",
+        "sort=recent",
+        "nsfw=1",
+        "g=8",
+        "g=-1",
+        "g=01",
+        "l=15",
+        "q=a&q=b",
+        "c=featured_artists.featured_artists",
+        "c=unknown",
+        "e=audio",
+        "cursor[x]=42",
+        "cursor[id]=0",
+        "cursor[id]=2000000000",
+        "cursor[rating]=NaN",
+        "cursor[rating]=-1",
+        "cursor[id][x]=1",
+        "cursor[id]=42&cursor[id]=43",
+        "cursor_string=abc&cursor[id]=42",
+        "q=%00",
+        "q=%FF",
+        "q=%GG",
+        "q=abc#fragment",
+        "uri=https://evil.invalid",
+    ] {
+        assert!(native_parse(raw).is_err(), "{raw}");
+    }
+    assert!(native_parse(&query(&[("q", &"星".repeat(201))])).is_err());
+    assert!(native_parse(&query(&[("cursor[title.raw]", &"a".repeat(1025))])).is_err());
+    assert!(native_parse(&"q=a".repeat(3000)).is_err());
+}
+
+#[test]
+fn official_search_native_projection_preserves_stats_without_foreign_owners_or_urls() {
+    let mut set = full_set();
+    set["title"] = json!(" Title\n星 ");
+    set["user_id"] = json!(444);
+    set["cover"] = json!("https://evil.invalid/private");
+    set["preview_url"] = json!("https://evil.invalid/private");
+    set["user"] = json!({"id":444,"email":"private@example.invalid"});
+    set["beatmaps"][0]["user_id"] = json!(777);
+    set["beatmaps"][0]["owners"] = json!([{"id":777}]);
+    set["play_count"] = json!(123);
+    set["favourite_count"] = json!(45);
+    set["beatmaps"][0]["playcount"] = json!(90);
+    set["beatmaps"][0]["passcount"] = json!(80);
+    set["beatmaps"][0]["lazer_only"] = json!(true);
+    let cursor = json!({"approved_date":1700000000000_i64,"id":42});
+    let result = transform(
+        &json!({"beatmapsets":[set],"total":100,"cursor":cursor,"cursor_string":"abc+/="}),
+    )
+    .unwrap();
+    let website = serde_json::to_value(&result).unwrap();
+    assert_eq!(website.as_object().unwrap().len(), 3);
+    assert!(website["items"][0].get("native").is_none());
+    assert!(website.get("native_cursor").is_none());
+    let native = native_result(&result);
+    assert_eq!(native["total"], 100);
+    assert_eq!(native["cursor"], cursor);
+    assert_eq!(native["cursor_string"], "abc+/=");
+    let item = &native["beatmapsets"][0];
+    assert_eq!(item["title"], "Title 星");
+    assert_eq!(item["play_count"], 123);
+    assert_eq!(item["favourite_count"], 45);
+    assert_eq!(item["beatmaps"].as_array().unwrap().len(), 3);
+    assert_eq!(item["beatmaps"][0]["id"], 420);
+    assert_eq!(item["beatmaps"][0]["difficulty_rating"], 3.5);
+    assert_eq!(item["beatmaps"][0]["checksum"], "a".repeat(32));
+    assert_eq!(item["beatmaps"][0]["hit_length"], 100);
+    assert_eq!(item["beatmaps"][2]["playcount"], 90);
+    assert_eq!(item["beatmaps"][2]["passcount"], 80);
+    assert_eq!(item["beatmaps"][2]["lazer_only"], true);
+    assert_eq!(item["user_id"], 0);
+    assert!(
+        item["beatmaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|map| map["user_id"] == 0 && map["owners"] == json!([]))
+    );
+    assert_eq!(
+        item["covers"]["card@2x"],
+        "https://assets.ppy.sh/beatmaps/42/covers/card@2x.jpg"
+    );
+    assert_eq!(item["preview_url"], "https://b.ppy.sh/preview/42.mp3");
+    assert!(item.get("user").is_none());
+    assert!(!native.to_string().contains("evil.invalid"));
+    assert_eq!(item["availability"]["download_disabled"], true);
+}
+
+#[test]
+fn official_search_native_cursor_metadata_and_full_response_bounds() {
+    for date in ["0", "1700000000000", "2020-01-02T03:04:05Z"] {
+        let raw = query(&[("cursor[approved_date]", date), ("cursor[id]", "42")]);
+        assert!(native_parse(&raw).is_ok(), "{date}");
+        let cursor = if date.contains('T') {
+            json!({"approved_date":date,"id":42})
+        } else {
+            json!({"approved_date":date.parse::<i64>().unwrap(),"id":42})
+        };
+        assert!(transform(&json!({"beatmapsets":[],"total":0,"cursor":cursor})).is_ok());
+    }
+    assert!(native_parse("cursor[id]=42").is_err());
+    assert!(native_parse("s=qualified&cursor[approved_date]=0&cursor[id]=42").is_err());
+    assert!(
+        native_parse("s=qualified&cursor[approved_date]=0&cursor[queued_at]=0&cursor[id]=42")
+            .is_ok()
+    );
+    assert!(native_parse("sort=nominations_desc&cursor[nominations]=1&cursor[id]=42").is_err());
+    assert!(
+        native_parse("sort=nominations_desc&cursor[nominations]=1&cursor[hype]=2&cursor[id]=42")
+            .is_ok()
+    );
+    assert!(native_cursor(Some(&json!({}))).unwrap().is_none());
+    let incomplete = transform(&json!({"beatmapsets":[],"total":0,"cursor":{"id":42}})).unwrap();
+    assert!(cursor_complete(&incomplete, &native_parse("").unwrap()).is_err());
+    for cursor in [
+        json!([]),
+        json!({"private":1}),
+        json!({"id":null}),
+        json!({"id":0}),
+        json!({"id":"42"}),
+        json!({"title.raw":true}),
+        json!({"rating":-1}),
+        json!({"title.raw":"x".repeat(1025)}),
+        json!({"id":{"url":"private"}}),
+    ] {
+        assert!(
+            transform(&json!({"beatmapsets":[],"total":0,"cursor":cursor})).is_err(),
+            "{cursor}"
+        );
+    }
+    for (field, value) in [
+        ("last_updated", json!("invalid")),
+        ("play_count", json!(-1)),
+        ("nsfw", json!("false")),
+        ("genre", json!({"id":0,"name":"Unknown"})),
+        ("tags", json!("x".repeat(4097))),
+    ] {
+        let mut value_set = full_set();
+        value_set[field] = value;
+        assert!(
+            transform(&json!({"beatmapsets":[value_set],"total":1})).is_err(),
+            "{field}"
+        );
+    }
+    let mut large = response();
+    large["beatmapsets"] = json!((1..=10).map(|set_id| {
+        let mut result = set(set_id);
+        result["beatmaps"] = json!((1..=512).map(|n| json!({"id":set_id*1000+n,"beatmapset_id":set_id,"version":"x".repeat(1024),"mode_int":0,"difficulty_rating":1,"total_length":1})).collect::<Vec<_>>());
+        result
+    }).collect::<Vec<_>>());
+    assert!(
+        transform(&large).is_err(),
+        "native serialized payload over 4MiB must fail closed"
+    );
+    let result = transform(&response()).unwrap();
+    let mut official = OfficialState::default();
+    let key = parse(None).unwrap();
+    remember(&mut official, key.clone(), &Ok(result.clone()));
+    assert_eq!(
+        official.search_cache[&key].bytes,
+        serde_json::to_vec(&result).unwrap().len()
+            + serde_json::to_vec(&native_result(&result)).unwrap().len()
+    );
+}
+
 fn set(set_id: i64) -> Value {
     json!({"id":set_id,"title":"Title 星", "artist":"Artist", "creator":"Mapper", "status":"ranked", "covers":{"card":"https://example.invalid/private"}, "user_id":99,
         "availability":{"download_disabled":false}, "beatmaps":[{"id":set_id*10,"beatmapset_id":set_id,"version":"Hard", "mode_int":0,"mode":"osu","difficulty_rating":5.5,"total_length":120}]})
@@ -990,6 +1250,273 @@ async fn native_metadata(app: &Router, user: i64) -> (StatusCode, Value) {
             .into_bytes(),
     )
     .await
+}
+
+async fn native_search_request(app: &Router, user: i64, query: &str) -> (StatusCode, Value) {
+    request(
+        app,
+        "/api/v1/internal/beatmapsets/search",
+        None,
+        true,
+        "application/json",
+        json!({"user_id":user,"query":query})
+            .to_string()
+            .into_bytes(),
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires an owned disposable PostgreSQL 17 database"]
+async fn official_search_native_auth_cache_fresh_withdrawal_and_archive_availability() {
+    let upstream = Upstream::start().await;
+    upstream.reply(StatusCode::OK,json!({"beatmapsets":[full_set()],"total":1,"cursor":{"approved_date":0,"id":42},"cursor_string":"cursor"}).to_string().into_bytes(),Duration::ZERO).await;
+    let fixture = MutationFixture::new("native_search_auth", upstream.origin.clone()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result=tokio::spawn(async move {
+        let (user,_,_,_)=actor(&state,"NativeSearchPlayer",&[]).await;
+        for bytes in [b"not JSON".to_vec(),vec![b' ';16385]] {
+            assert_eq!(request(&app,"/api/v1/internal/beatmapsets/search",None,false,"application/json",bytes).await.0,StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(native_search_request(&app,0,"").await.0,StatusCode::BAD_REQUEST);
+        assert_eq!(native_search_request(&app,i64::MAX,"").await.0,StatusCode::UNAUTHORIZED);
+        assert_eq!(request(&app,"/api/v1/internal/beatmapsets/search",None,true,"application/json",vec![b' ';16385]).await.0,StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(request(&app,"/api/v1/internal/beatmapsets/search",None,true,"application/json",json!({"user_id":user,"query":"","url":"private"}).to_string().into_bytes()).await.0,StatusCode::BAD_REQUEST);
+        for query in ["played=played","r=SH","s=mine","c=follows"] {
+            let (status,value)=native_search_request(&app,user,query).await;
+            assert_eq!(status,StatusCode::BAD_REQUEST);assert_eq!(value["error"]["code"],"unsupported_search_filter");
+        }
+        assert_eq!(upstream.calls(),0);
+        assert_eq!(get_public_search(&app,"").await.0,StatusCode::OK);
+        let (status,value)=native_search_request(&app,user,"s=ranked&nsfw=false").await;
+        assert_eq!(status,StatusCode::OK,"{value}");assert_eq!(value["beatmapsets"][0]["beatmaps"].as_array().unwrap().len(),3);
+        assert_eq!(value["cursor"],json!({"approved_date":0,"id":42}));
+        assert_eq!(value["beatmapsets"][0]["availability"]["download_disabled"],true);
+        assert_eq!(upstream.calls(),1,"equivalent native and website browse share metadata cache");
+        let queries=upstream.state.queries.lock().await.clone();
+        let url=reqwest::Url::parse(&format!("https://osu.ppy.sh/?{}",queries[0])).unwrap();
+        assert_eq!(url.query_pairs().filter(|(name,_)|name=="nsfw").map(|(_,value)|value.to_string()).collect::<Vec<_>>(),["false"]);
+        no_writes(&state,0).await;
+        let archive=Uuid::new_v4();
+        let mut transaction=state.db.begin().await.unwrap();
+        let mut members=Vec::new();
+        for (id,hash) in [(420,"a"),(421,"b"),(422,"c")] {
+            let member:i64=sqlx::query_scalar("INSERT INTO beatmaps(official_id,official_set_id,title,artist,creator,version,mode,status,source,stars,md5,osu_path) VALUES($1,42,'Owned fixture','A','C','V',0,'ranked','official',1,$2,'private.osu') RETURNING id")
+                .bind(id).bind(hash.repeat(32)).fetch_one(&mut *transaction).await.unwrap();
+            members.push(member);
+        }
+        sqlx::query("INSERT INTO official_beatmapset_archives(official_set_id,id,archive_path,sha256,byte_length,member_md5,uploaded_by) VALUES(42,$1,$2,$3,1,$4,$5)")
+            .bind(archive).bind(format!("official-package-{archive}/package.osz")).bind("0".repeat(64)).bind(vec!["a".repeat(32),"b".repeat(32),"c".repeat(32)]).bind(user).execute(&mut *transaction).await.unwrap();
+        for member in members {sqlx::query("INSERT INTO official_beatmapset_archive_members(archive_id,beatmap_id) VALUES($1,$2)").bind(archive).bind(member).execute(&mut *transaction).await.unwrap();}
+        transaction.commit().await.unwrap();
+        let (_,value)=native_search_request(&app,user,"s=ranked").await;
+        assert_eq!(value["beatmapsets"][0]["availability"]["download_disabled"],false);
+        sqlx::query("INSERT INTO beatmapset_availability(native_set_id,withdrawn,revision,reason,actor_id) VALUES(42,true,1,'Owned search fixture',$1)").bind(user).execute(&state.db).await.unwrap();
+        let (_,value)=native_search_request(&app,user,"s=ranked").await;assert_eq!(value["beatmapsets"],json!([]));
+        sqlx::query("UPDATE users SET is_restricted=true WHERE id=$1").bind(user).execute(&state.db).await.unwrap();
+        assert_eq!(native_search_request(&app,user,"s=ranked").await.0,StatusCode::UNAUTHORIZED);
+        assert_eq!(upstream.calls(),1);
+        for (table,expected) in [("beatmaps",3),("official_beatmapset_archives",1),("official_beatmapset_archive_members",3),("beatmap_filename_aliases",0),("audit_events",0)] {
+            let count:i64=sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(&state.db).await.unwrap();
+            assert_eq!(count,expected,"native search must not write {table}");
+        }
+        assert_eq!(file_count(&state.maps_root).await,0);
+    }).await;
+    fixture.finish(result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an owned disposable PostgreSQL 17 database"]
+async fn official_search_native_full_filter_cursor_and_coalesced_restriction() {
+    let upstream = Upstream::start().await;
+    upstream
+        .reply(
+            StatusCode::OK,
+            json!({"beatmapsets":[full_set()],"total":1,"cursor":{"title.raw":"Title 星","id":42}})
+                .to_string()
+                .into_bytes(),
+            Duration::from_millis(400),
+        )
+        .await;
+    let fixture = MutationFixture::new("native_search_flight", upstream.origin.clone()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result = tokio::spawn(async move {
+        let (first, _, _, _) = actor(&state, "NativeSearchFirst", &[]).await;
+        let (second, _, _, _) = actor(&state, "NativeSearchSecond", &[]).await;
+        let raw = query(&[
+            ("q", "歌 & 星"),
+            ("m", "2"),
+            ("s", "leaderboard"),
+            ("sort", "title_asc"),
+            ("nsfw", "true"),
+            ("c", "featured_artists.spotlights"),
+            ("e", "storyboard.video"),
+            ("g", "5"),
+            ("l", "3"),
+            ("cursor[title.raw]", "A & 歌"),
+            ("cursor[id]", "41"),
+        ]);
+        let first_app = app.clone();
+        let first_raw = raw.clone();
+        let first_task =
+            tokio::spawn(async move { native_search_request(&first_app, first, &first_raw).await });
+        upstream.wait_calls(1).await;
+        let second_app = app.clone();
+        let second_task =
+            tokio::spawn(async move { native_search_request(&second_app, second, &raw).await });
+        sqlx::query("UPDATE users SET is_restricted=true WHERE id=$1")
+            .bind(first)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(first_task.await.unwrap().0, StatusCode::UNAUTHORIZED);
+        let (status, value) = second_task.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["cursor"], json!({"title.raw":"Title 星","id":42}));
+        assert_eq!(upstream.calls(), 1);
+        let queries = upstream.state.queries.lock().await.clone();
+        let url = reqwest::Url::parse(&format!("https://osu.ppy.sh/?{}", queries[0])).unwrap();
+        let fields = url.query_pairs().collect::<HashMap<_, _>>();
+        for (name, value) in [
+            ("q", "歌 & 星"),
+            ("m", "2"),
+            ("s", "leaderboard"),
+            ("sort", "title_asc"),
+            ("nsfw", "true"),
+            ("c", "featured_artists.spotlights"),
+            ("e", "storyboard.video"),
+            ("g", "5"),
+            ("l", "3"),
+            ("cursor[title.raw]", "A & 歌"),
+            ("cursor[id]", "41"),
+        ] {
+            assert_eq!(fields[name], value, "{name}");
+        }
+        assert_eq!(
+            state.official.lock().await.public_discovery_requests.len(),
+            1
+        );
+        no_writes(&state, 0).await;
+    })
+    .await;
+    fixture.finish(result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an owned disposable PostgreSQL 17 database"]
+async fn official_search_native_budget_and_global_backoff_share_public_discovery() {
+    let upstream = Upstream::start().await;
+    let fixture = MutationFixture::new("native_search_budget", upstream.origin.clone()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result = tokio::spawn(async move {
+        let (user, _, _, _) = actor(&state, "NativeSearchBudget", &[]).await;
+        assert_eq!(get_public_search(&app, "").await.0, StatusCode::OK);
+        {
+            let mut official = state.official.lock().await;
+            official.public_discovery_requests = vec![Instant::now(); 30];
+        }
+        assert_eq!(
+            native_search_request(&app, user, "s=ranked").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            native_search_request(&app, user, "q=miss").await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(upstream.calls(), 1);
+        state
+            .official
+            .lock()
+            .await
+            .public_discovery_requests
+            .clear();
+        upstream
+            .reply(StatusCode::TOO_MANY_REQUESTS, vec![], Duration::ZERO)
+            .await;
+        let (_, value) = native_search_request(&app, user, "q=limited").await;
+        assert_eq!(value["error"]["code"], "official_rate_limited");
+        assert_eq!(
+            get_public_search(&app, "q=public-other").await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            native_search_request(&app, user, "q=native-other").await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(upstream.calls(), 2);
+        sqlx::query("UPDATE users SET is_restricted=true WHERE id=$1")
+            .bind(user)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            native_search_request(&app, user, "q=limited").await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        no_writes(&state, 0).await;
+    })
+    .await;
+    fixture.finish(result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an owned disposable PostgreSQL 17 database"]
+async fn official_search_native_and_website_apply_fresh_private_status_overrides() {
+    let upstream = Upstream::start().await;
+    let mut upstream_set = full_set();
+    upstream_set["status"] = json!("pending");
+    for map in upstream_set["beatmaps"].as_array_mut().unwrap() {
+        map["status"] = json!("pending");
+    }
+    upstream
+        .reply(
+            StatusCode::OK,
+            json!({"beatmapsets":[upstream_set],"total":1})
+                .to_string()
+                .into_bytes(),
+            Duration::ZERO,
+        )
+        .await;
+    let fixture = MutationFixture::new("native_search_overrides", upstream.origin.clone()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result=tokio::spawn(async move {
+        let (user,_,_,_)=actor(&state,"NativeStatusPlayer",&[]).await;
+        assert_eq!(native_search_request(&app,user,"s=any").await.0,StatusCode::OK);
+        for (id,status) in [(420,"ranked"),(421,"wip"),(422,"pending")] {
+            sqlx::query("INSERT INTO beatmap_status_overrides(native_id,native_set_id,status,actor_id,reason) VALUES($1,42,$2,$3,'Owned fixture')")
+                .bind(id).bind(status).bind(user).execute(&state.db).await.unwrap();
+        }
+        let (code,native)=native_search_request(&app,user,"s=any").await;assert_eq!(code,StatusCode::OK,"{native}");
+        let set=&native["beatmapsets"][0];assert_eq!(set["status"],"pending","mixed set must not falsely appear wholly ranked");
+        for (index,status,rank) in [(0,"ranked",1),(1,"wip",-1),(2,"pending",0)] {
+            assert_eq!(set["beatmaps"][index]["status"],status);assert_eq!(set["beatmaps"][index]["ranked"],rank);
+        }
+        let (code,website)=get_public_search(&app,"status=any").await;assert_eq!(code,StatusCode::OK,"{website}");
+        let item=&website["items"][0];assert_eq!(item["status"],"pending");
+        assert_eq!(item["difficulties"].as_array().unwrap().iter().map(|map|map["status"].as_str().unwrap()).collect::<Vec<_>>(),["ranked","wip","pending"]);
+        assert_eq!(item["local"].as_object().unwrap().len(),3,"private override identities are not public local fields");
+        sqlx::query("UPDATE beatmap_status_overrides SET status='graveyard' WHERE native_id=420").execute(&state.db).await.unwrap();
+        let (_,native)=native_search_request(&app,user,"s=any").await;
+        assert_eq!(native["beatmapsets"][0]["beatmaps"][0]["ranked"],-2);assert_eq!(native["beatmapsets"][0]["beatmaps"][1]["status"],"wip");
+        for status in ["loved","unranked","pending"] {
+            sqlx::query("UPDATE beatmap_status_overrides SET status=$1 WHERE native_set_id=42").bind(status).execute(&state.db).await.unwrap();
+            let before:Value=sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(o) ORDER BY native_id) FROM beatmap_status_overrides o").fetch_one(&state.db).await.unwrap();
+            let native_status=if status=="unranked" {"pending"} else {status};let rank=if status=="loved" {4} else {0};
+            let (_,native)=native_search_request(&app,user,"s=any").await;
+            assert_eq!(native["beatmapsets"][0]["status"],native_status);
+            assert!(native["beatmapsets"][0]["beatmaps"].as_array().unwrap().iter().all(|map| map["status"]==native_status && map["ranked"]==rank));
+            assert_eq!(get_public_search(&app,"status=any").await.1["items"][0]["status"],status);
+            let after:Value=sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(o) ORDER BY native_id) FROM beatmap_status_overrides o").fetch_one(&state.db).await.unwrap();
+            assert_eq!(before,after,"search does not write decisions or revision counters");
+        }
+        assert_eq!(upstream.calls(),1,"private moderation does not enter the shared upstream cache");
+        no_writes(&state,0).await;
+    }).await;
+    fixture.finish(result).await;
 }
 
 #[tokio::test]
