@@ -273,6 +273,201 @@ async fn expire(db: &PgPool, sid: Uuid) {
 
 #[tokio::test]
 #[ignore = "requires ILLYA_TEST_DATABASE_URL pointing to disposable PostgreSQL 17"]
+async fn website_pm_receipts_keep_late_commits_unread() {
+    let url =
+        std::env::var("ILLYA_TEST_DATABASE_URL").expect("Set disposable website chat fixture URL");
+    let control = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&control)
+        .await
+        .unwrap();
+    assert!((170000..180000).contains(&version));
+    let schema = format!("illya_pm_receipts_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&control)
+        .await
+        .unwrap();
+    let options = PgConnectOptions::from_str(&url)
+        .unwrap()
+        .options([("search_path", schema.as_str())])
+        .application_name(&schema);
+    let db = PgPoolOptions::new()
+        .max_connections(12)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    sqlx::migrate!("../../migrations").run(&db).await.unwrap();
+    let state = fixture_state(db.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = router(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let pool = db.clone();
+    let app_name = schema.clone();
+    let outcome = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let base = format!("http://{address}");
+        let (reader, reader_role, reader_sid, cookie) = actor(&state, "ReceiptReader", &["chat.send"]).await;
+        let (sender, _, _, sender_cookie) = actor(&state, "ReceiptSender", &["chat.send"]).await;
+        let (hidden_sender, _, _, _) = actor(&state, "ReceiptHidden", &["chat.send"]).await;
+        let (foreign, _, _, foreign_cookie) = actor(&state, "ReceiptForeign", &["*"]).await;
+        let (code, created) = request(&client, &base, Method::POST, "/api/v1/conversations", &cookie,
+            Some(json!({"target_id":sender}))).await;
+        assert_eq!(code, StatusCode::OK, "{created}");
+        let channel = created["id"].as_i64().unwrap();
+        let path = format!("/api/v1/conversations/{channel}");
+        let read_path = format!("{path}/read");
+        let messages_path = format!("{path}/messages");
+        let (_, website) = request(&client, &base, Method::POST, &messages_path, &sender_cookie,
+            Some(json!({"content":"website-origin incoming", "client_uuid":"receipts:website"}))).await;
+        let website_id = website["id"].as_i64().unwrap();
+        assert!(website["private_message_id"].as_i64().is_some());
+        let own = private(&pool, reader, sender, "own message", None).await;
+        assert_eq!(request(&client, &base, Method::PUT, &read_path, &cookie,
+            Some(json!({"message_id":own}))).await.0, StatusCode::NO_CONTENT);
+        let acknowledged: Vec<i64> = sqlx::query_scalar("SELECT message_id FROM pm_read_receipts WHERE reader_id=$1 ORDER BY message_id")
+            .bind(reader).fetch_all(&pool).await.unwrap();
+        assert_eq!(acknowledged, vec![website_id], "own messages never need a receipt");
+
+        // The native bridge currently locks the pair channel until commit, so
+        // website mutation fences serialize against it. Exercise the genuine
+        // MVCC race with the native marker UPDATE and a shared-history fixture
+        // in transaction two, while transaction one holds its bridged PM open.
+        let mut late = pool.begin().await.unwrap();
+        let native_id: i64 = sqlx::query_scalar("INSERT INTO protocol_private_messages(sender_id,recipient_id,content) VALUES($1,$2,'late native PM') RETURNING id")
+            .bind(sender).bind(reader).fetch_one(&mut *late).await.unwrap();
+        let low: i64 = sqlx::query_scalar("SELECT id FROM chat_messages WHERE private_message_id=$1")
+            .bind(native_id).fetch_one(&mut *late).await.unwrap();
+        let mut first_commit = pool.begin().await.unwrap();
+        let high: i64 = sqlx::query_scalar("INSERT INTO chat_messages(channel_id,user_id,content) VALUES($1,$2,'higher first commit') RETURNING id")
+            .bind(channel).bind(sender).fetch_one(&mut *first_commit).await.unwrap();
+        assert!(high > low);
+        let updated = sqlx::query("UPDATE lazer_channel_members SET last_read_id=$3 WHERE user_id=$1 AND channel_id=$2 AND last_read_id<=$3 AND EXISTS(SELECT 1 FROM chat_messages WHERE id=$3 AND channel_id=$2)")
+            .bind(reader).bind(channel).bind(high).execute(&mut *first_commit).await.unwrap().rows_affected();
+        assert_eq!(updated, 1);
+        first_commit.commit().await.unwrap();
+        let (_, before_commit) = request(&client, &base, Method::GET, &path, &cookie, None).await;
+        assert_eq!(before_commit["unread_count"], 0);
+        let low_receipt: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pm_read_receipts WHERE reader_id=$1 AND message_id=$2)")
+            .bind(reader).bind(low).fetch_one(&pool).await.unwrap();
+        assert!(!low_receipt, "an uncommitted message cannot receive a receipt");
+        late.commit().await.unwrap();
+        let legacy_unread: i64 = sqlx::query_scalar("SELECT count(*) FROM chat_messages WHERE channel_id=$1 AND user_id<>$2 AND id>$3")
+            .bind(channel).bind(reader).bind(high).fetch_one(&pool).await.unwrap();
+        assert_eq!(legacy_unread, 0, "the original cursor falsely classifies the late native PM as read");
+        let (_, after_commit) = request(&client, &base, Method::GET, &path, &cookie, None).await;
+        assert_eq!(after_commit["last_read_id"], high);
+        assert_eq!(after_commit["unread_count"], 1, "a committed lower-ID native PM remains unread");
+        let (_, listed) = request(&client, &base, Method::GET, "/api/v1/conversations", &cookie, None).await;
+        assert_eq!(listed["items"][0]["unread_count"], 1);
+
+        // Repeating the existing API marker reads the newly committed row;
+        // concurrent repetitions are idempotent and do not move it backwards.
+        let body = json!({"message_id":high});
+        let (first, second) = tokio::join!(
+            request(&client, &base, Method::PUT, &read_path, &cookie, Some(body.clone())),
+            request(&client, &base, Method::PUT, &read_path, &cookie, Some(body)));
+        assert_eq!(first.0, StatusCode::NO_CONTENT);
+        assert_eq!(second.0, StatusCode::NO_CONTENT);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM pm_read_receipts WHERE reader_id=$1 AND message_id=$2")
+            .bind(reader).bind(low).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(request(&client, &base, Method::PUT, &read_path, &cookie,
+            Some(json!({"message_id":low}))).await.0, StatusCode::BAD_REQUEST);
+
+        // Invisible senders never acquire receipts, even below a visible
+        // marker. Unhiding such a row therefore exposes it as unread.
+        sqlx::query("UPDATE users SET is_restricted=true WHERE id=$1")
+            .bind(hidden_sender).execute(&pool).await.unwrap();
+        let restricted = public(&pool, hidden_sender, channel, "restricted shared history fixture").await;
+        sqlx::query("INSERT INTO user_relationships(user_id,target_id,relation_type) VALUES($1,$2,'block')")
+            .bind(reader).bind(foreign).execute(&pool).await.unwrap();
+        let blocked = public(&pool, foreign, channel, "blocked shared history fixture").await;
+        let marker = private(&pool, sender, reader, "visible incoming marker", None).await;
+        assert_eq!(request(&client, &base, Method::PUT, &read_path, &cookie,
+            Some(json!({"message_id":marker}))).await.0, StatusCode::NO_CONTENT);
+        let excluded: i64 = sqlx::query_scalar("SELECT count(*) FROM pm_read_receipts WHERE reader_id=$1 AND message_id=ANY($2)")
+            .bind(reader).bind(vec![own, restricted, blocked]).fetch_one(&pool).await.unwrap();
+        assert_eq!(excluded, 0);
+        assert_eq!(request(&client, &base, Method::PUT, &read_path, &foreign_cookie,
+            Some(json!({"message_id":marker}))).await.0, StatusCode::NOT_FOUND);
+        sqlx::query("UPDATE users SET is_restricted=false WHERE id=$1")
+            .bind(hidden_sender).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM user_relationships WHERE user_id=$1 AND target_id=$2")
+            .bind(reader).bind(foreign).execute(&pool).await.unwrap();
+        let (_, unhidden) = request(&client, &base, Method::GET, &path, &cookie, None).await;
+        assert_eq!(unhidden["unread_count"], 2);
+
+        // A role change at the permission fence preserves read access without
+        // chat.send. A session revoked at the user fence rolls receipts back.
+        let mut role_blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE roles,user_roles IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *role_blocker).await.unwrap();
+        let work = tokio::spawn({let client=client.clone();let base=base.clone();let path=read_path.clone();let cookie=cookie.clone();
+            async move { request(&client, &base, Method::PUT, &path, &cookie, Some(json!({"message_id":marker}))).await }});
+        wait_lock(&pool, &app_name, "LOCK TABLE roles,user_roles IN SHARE MODE").await;
+        sqlx::query("UPDATE roles SET permissions='{}' WHERE id=$1")
+            .bind(reader_role).execute(&mut *role_blocker).await.unwrap();
+        role_blocker.commit().await.unwrap();
+        assert_eq!(work.await.unwrap().0, StatusCode::NO_CONTENT);
+        let pending = private(&pool, sender, reader, "revoked session incoming", None).await;
+        let mut session_blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+            .bind(reader).fetch_one(&mut *session_blocker).await.unwrap();
+        let work = tokio::spawn({let client=client.clone();let base=base.clone();let path=read_path.clone();let cookie=cookie.clone();
+            async move { request(&client, &base, Method::PUT, &path, &cookie, Some(json!({"message_id":pending}))).await }});
+        wait_lock(&pool, &app_name, "SELECT id FROM users WHERE id=ANY").await;
+        sqlx::query("DELETE FROM sessions WHERE id=$1")
+            .bind(reader_sid).execute(&mut *session_blocker).await.unwrap();
+        session_blocker.commit().await.unwrap();
+        assert_eq!(work.await.unwrap().0, StatusCode::UNAUTHORIZED);
+        let rolled_back: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pm_read_receipts WHERE reader_id=$1 AND message_id=$2)")
+            .bind(reader).bind(pending).fetch_one(&pool).await.unwrap();
+        assert!(!rolled_back);
+
+        // Receipts are durable across pool/session reconnects and a PM leave /
+        // rejoin; unread incoming rows remain available after both transitions.
+        let reconnect = PgPoolOptions::new().max_connections(2).connect_with(options).await.unwrap();
+        let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM pm_read_receipts WHERE reader_id=$1 AND message_id=$2")
+            .bind(reader).bind(low).fetch_one(&reconnect).await.unwrap();
+        assert_eq!(retained, 1);
+        reconnect.close().await;
+        sqlx::query("DELETE FROM lazer_channel_members WHERE user_id=$1 AND channel_id=$2")
+            .bind(reader).bind(channel).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO lazer_channel_members(user_id,channel_id) VALUES($1,$2)")
+            .bind(reader).bind(channel).execute(&pool).await.unwrap();
+        let (_, fresh_cookie) = session(&state, reader).await;
+        let (_, recovered) = request(&reqwest::Client::new(), &base, Method::GET, &path, &fresh_cookie, None).await;
+        assert_eq!(recovered["unread_count"], 1);
+        assert_eq!(request(&client, &base, Method::PUT, &read_path, &fresh_cookie,
+            Some(json!({"message_id":pending}))).await.0, StatusCode::NO_CONTENT);
+        let (_, read) = request(&client, &base, Method::GET, &path, &fresh_cookie, None).await;
+        assert_eq!(read["unread_count"], 0);
+    }).await;
+    server.abort();
+    let _ = server.await;
+    db.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&control)
+        .await
+        .unwrap();
+    control.close().await;
+    outcome.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL pointing to disposable PostgreSQL 17"]
 async fn website_conversations_commit_delivery_and_mutation_fences() {
     let url =
         std::env::var("ILLYA_TEST_DATABASE_URL").expect("Set disposable website chat fixture URL");
@@ -487,6 +682,7 @@ async fn website_conversations_commit_delivery_and_mutation_fences() {
             let work=tokio::spawn({let c=client.clone();let b=base.clone();async move{request(&c,&b,method,&path,&cookie,Some(body)).await}});
             wait_lock(&pool,&app_name,if operation=="create" {"illya_pm_channel"} else {"FOR SHARE OF c"}).await;expire(&pool,sid).await;blocker.commit().await.unwrap();let(code,value)=work.await.unwrap();assert_eq!(code,StatusCode::UNAUTHORIZED,"{operation}: {value}");
             let read:i64=sqlx::query_scalar("SELECT last_read_id FROM lazer_channel_members WHERE user_id=$1 AND channel_id=$2").bind(id).bind(queued_channel).fetch_one(&pool).await.unwrap();assert_eq!(read,0);
+            let receipts:i64=sqlx::query_scalar("SELECT count(*) FROM pm_read_receipts WHERE reader_id=$1").bind(id).fetch_one(&pool).await.unwrap();assert_eq!(receipts,0,"{operation}: expired mutation rolls back receipts with its marker");
             let inserted:i64=sqlx::query_scalar("SELECT count(*) FROM chat_messages WHERE user_id=$1").bind(id).fetch_one(&pool).await.unwrap();assert_eq!(inserted,0);
         }
         // Policy changes queued on the peer lock are observed before insertion.

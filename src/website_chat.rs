@@ -226,8 +226,8 @@ async fn conversation(state: &AppState, user: &auth::User, id: i64) -> ApiResult
         .bind(user.id).bind(id).fetch_one(&state.db).await?;
     let preview: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(m)||jsonb_build_object('username',u.username,'avatar_url',u.avatar_url) FROM chat_messages m JOIN users u ON u.id=m.user_id WHERE m.channel_id=$1 AND NOT u.is_restricted AND NOT EXISTS(SELECT 1 FROM user_relationships r WHERE r.relation_type='block' AND ((r.user_id=$2 AND r.target_id=m.user_id) OR (r.target_id=$2 AND r.user_id=m.user_id))) ORDER BY m.id DESC LIMIT 1")
         .bind(id).bind(user.id).fetch_optional(&state.db).await?;
-    let unread: i64 = sqlx::query_scalar("SELECT count(*) FROM chat_messages m JOIN users u ON u.id=m.user_id WHERE m.channel_id=$1 AND m.id>$3 AND m.user_id<>$2 AND NOT u.is_restricted AND NOT EXISTS(SELECT 1 FROM user_relationships r WHERE r.relation_type='block' AND ((r.user_id=$2 AND r.target_id=m.user_id) OR (r.target_id=$2 AND r.user_id=m.user_id)))")
-        .bind(id).bind(user.id).bind(last_read).fetch_one(&state.db).await?;
+    let unread: i64 = sqlx::query_scalar("SELECT count(*) FROM chat_messages m JOIN users u ON u.id=m.user_id WHERE m.channel_id=$1 AND m.user_id<>$2 AND NOT u.is_restricted AND NOT EXISTS(SELECT 1 FROM user_relationships r WHERE r.relation_type='block' AND ((r.user_id=$2 AND r.target_id=m.user_id) OR (r.target_id=$2 AND r.user_id=m.user_id))) AND NOT EXISTS(SELECT 1 FROM pm_read_receipts receipt WHERE receipt.reader_id=$2 AND receipt.message_id=m.id)")
+        .bind(id).bind(user.id).fetch_one(&state.db).await?;
     let mut policy_tx = state.db.begin().await?;
     let status = chat_moderation::sending_status(&mut policy_tx, user).await?;
     let restriction = if status.send_restriction.is_some() {
@@ -471,6 +471,9 @@ pub async fn mark_read(
             "Read markers cannot move backwards or name an unavailable message.",
         ));
     }
+    // The database trigger records only rows visible in this acknowledgement's
+    // snapshot, including native PMs. Equal cursors refresh that snapshot so a
+    // lower ID committed after a prior read can be explicitly acknowledged.
     auth::ensure_mutation_actor(&mut tx, &actor).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
