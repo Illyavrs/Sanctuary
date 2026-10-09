@@ -1,6 +1,7 @@
 //! Private, versioned player nominations and set-consistent staff decisions.
 use crate::{
     ApiError, ApiResult, AppState, auth, beatmap_availability as availability, maps, page,
+    server_catalogue,
 };
 use axum::{
     Json,
@@ -686,6 +687,34 @@ async fn set_projection(
         "difficulties":rows,"representative_id":representative,"availability":availability}),
     )
 }
+fn verify_catalogue_decision(
+    snapshot: &Value,
+    manifest: &[Value],
+    selected: &[i64],
+) -> ApiResult<()> {
+    let maps = snapshot["beatmaps"]
+        .as_array()
+        .ok_or_else(status_conflict)?;
+    for native_id in selected {
+        let proof = manifest
+            .iter()
+            .find(|m| m["native_id"].as_i64() == Some(*native_id))
+            .ok_or_else(status_conflict)?;
+        let current = maps
+            .iter()
+            .find(|m| m["id"].as_i64() == Some(*native_id))
+            .ok_or_else(status_conflict)?;
+        if proof["md5"]
+            .as_str()
+            .zip(current["checksum"].as_str())
+            .is_none_or(|(a, b)| !a.eq_ignore_ascii_case(b))
+            || proof["mode"] != current["mode_int"]
+        {
+            return Err(status_conflict());
+        }
+    }
+    Ok(())
+}
 pub(crate) async fn staff_set(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -722,10 +751,16 @@ pub(crate) async fn update_difficulty(
     valid_status(&input.status)?;
     let reason = reason(&input.reason)?;
     let result = staff_snapshot(&state, &headers, set_id).await;
+    let catalogue = if set_id < LOCAL_SET_MIN && result.is_ok() {
+        Some(maps::catalogue_snapshot(&state, set_id).await)
+    } else {
+        None
+    };
     auth::require(&state, &headers)
         .await?
         .require("beatmaps.moderate")?;
     let metadata = result?;
+    let catalogue = catalogue.transpose()?;
     let manifest = metadata["manifest"]
         .as_array()
         .ok_or_else(ApiError::missing)?;
@@ -733,6 +768,9 @@ pub(crate) async fn update_difficulty(
         .iter()
         .find(|map| map["native_id"].as_i64() == Some(native_id))
         .ok_or_else(ApiError::missing)?;
+    if let Some(snapshot) = &catalogue {
+        verify_catalogue_decision(snapshot, manifest, &[native_id])?;
+    }
     let mut tx = state.db.begin().await?;
     let actor = auth::mutation_actor(&mut tx, &user, &[], auth::MutationScope::Permissions).await?;
     actor.require("beatmaps.moderate")?;
@@ -770,6 +808,9 @@ pub(crate) async fn update_difficulty(
         row.as_ref(),
     )
     .await?;
+    if let Some(snapshot) = catalogue {
+        server_catalogue::publish(&mut tx, set_id, &snapshot, &[native_id]).await?;
+    }
     let value = set_projection(&mut tx, set_id, &metadata).await?;
     auth::ensure_mutation_actor(&mut tx, &actor).await?;
     tx.commit().await?;
@@ -902,6 +943,15 @@ pub(crate) async fn review(
         } else {
             None
         };
+    let catalogue = if official.is_some() {
+        let result = maps::catalogue_snapshot(&state, set_id).await;
+        let current = auth::require(&state, &headers).await?;
+        current.require("beatmaps.rank.review")?;
+        current.require("beatmaps.moderate")?;
+        Some(result?)
+    } else {
+        None
+    };
     let mut tx = state.db.begin().await?;
     let actor = auth::mutation_actor(&mut tx, &user, &[], auth::MutationScope::Permissions).await?;
     actor.require("beatmaps.rank.review")?;
@@ -920,6 +970,15 @@ pub(crate) async fn review(
             None => local_metadata(&mut tx, set_id, row.get("requester_id")).await?,
         };
         let current = current["manifest"].as_array().ok_or_else(ineligible)?;
+        if let Some(snapshot) = &catalogue {
+            let ids = selected
+                .as_ref()
+                .ok_or_else(ineligible)?
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            verify_catalogue_decision(snapshot, current, &ids)?;
+        }
         for native_id in selected.as_ref().ok_or_else(ineligible)? {
             let requested = requested
                 .iter()
@@ -967,6 +1026,13 @@ pub(crate) async fn review(
             .await?;
         }
     }
+    if let Some(snapshot) = catalogue {
+        let reauthorized = selected
+            .as_ref()
+            .map(|ids| ids.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        server_catalogue::publish(&mut tx, set_id, &snapshot, &reauthorized).await?;
+    }
     let approved = selected
         .as_ref()
         .map(|ids| ids.iter().copied().collect::<Vec<_>>());
@@ -983,6 +1049,19 @@ pub(crate) async fn review(
 #[cfg(test)]
 mod validation_tests {
     use super::*;
+    #[test]
+    fn decision_cannot_publish_a_different_checksum_or_ruleset_snapshot() {
+        let manifest = vec![json!({"native_id":31,"md5":"a".repeat(32),"mode":0})];
+        let matching = json!({"beatmaps":[{"id":31,"checksum":"a".repeat(32),"mode_int":0}]});
+        assert!(verify_catalogue_decision(&matching, &manifest, &[31]).is_ok());
+        for changed in [
+            json!({"beatmaps":[{"id":31,"checksum":"b".repeat(32),"mode_int":0}]}),
+            json!({"beatmaps":[{"id":31,"checksum":"a".repeat(32),"mode_int":3}]}),
+            json!({"beatmaps":[{"id":32,"checksum":"a".repeat(32),"mode_int":0}]}),
+        ] {
+            assert!(verify_catalogue_decision(&changed, &manifest, &[31]).is_err());
+        }
+    }
     #[test]
     fn reasons_and_target_selectors_are_bounded() {
         assert_eq!(reason("  ready for review  ").unwrap(), "ready for review");

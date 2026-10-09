@@ -29,6 +29,7 @@ mod official_set_metadata;
 pub use official_set_metadata::metadata;
 #[path = "official_search.rs"]
 mod official_search;
+pub(crate) use official_search::catalogue_snapshot;
 pub use official_search::native_search;
 pub use official_search::search as search_official;
 pub(crate) use official_search::staff_detail as official_staff_detail;
@@ -1385,7 +1386,7 @@ impl Resolve {
 fn valid_checksum(checksum: &str) -> bool {
     checksum.len() == 32 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
-fn require_service_key(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+pub(crate) fn require_service_key(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let supplied = headers
         .get("x-illya-service-key")
         .and_then(|value| value.to_str().ok())
@@ -1402,7 +1403,7 @@ fn require_service_key(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
         Ok(())
     }
 }
-async fn require_active_user(state: &AppState, id: i64) -> ApiResult<()> {
+pub(crate) async fn require_active_user(state: &AppState, id: i64) -> ApiResult<()> {
     let active: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND NOT is_restricted)")
             .bind(id)

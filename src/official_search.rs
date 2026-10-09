@@ -475,6 +475,8 @@ struct Item {
     local: Local,
     #[serde(skip)]
     native: Value,
+    #[serde(skip)]
+    catalogue_complete: bool,
 }
 #[derive(Clone, Serialize)]
 struct SearchResult {
@@ -948,6 +950,19 @@ fn transform(value: &Value) -> ApiResult<SearchResult> {
             },
             _ => return Err(invalid()),
         };
+        // Public discovery tolerates absent optional fields. Publication requires
+        // a complete original-difficulty manifest before using its sanitized projection.
+        let mut originals = set.clone();
+        originals["beatmaps"] = json!(
+            maps.iter()
+                .filter(|map| difficulties
+                    .iter()
+                    .any(|d| map["id"].as_i64() == Some(d.official_id)))
+                .collect::<Vec<_>>()
+        );
+        let catalogue_complete =
+            illya_domain::official_set::OfficialSetMetadata::from_upstream(&originals, set_id)
+                .is_ok();
         let native = native_projection(set, set_id, &status, &difficulties)?;
         items.push(Item {
             official_set_id: set_id,
@@ -961,6 +976,7 @@ fn transform(value: &Value) -> ApiResult<SearchResult> {
             difficulties,
             local: Local::default(),
             native,
+            catalogue_complete,
         });
     }
     let result = SearchResult {
@@ -1285,6 +1301,32 @@ pub async fn search(
     Ok(Json(
         serde_json::to_value(result).map_err(ApiError::internal)?,
     ))
+}
+
+/// Complete, sanitized, unmerged public metadata for an atomic rank decision.
+/// Uses the same bounded upstream flight, cache and rate budget as discovery.
+pub(crate) async fn catalogue_snapshot(state: &AppState, set_id: i64) -> ApiResult<Value> {
+    if !(1..=MAX_OFFICIAL_ID).contains(&set_id) {
+        return Err(ApiError::bad("Supply an official beatmap set ID."));
+    }
+    let mut key = parse(None)?;
+    key.set_id = Some(set_id);
+    let result = tokio::time::timeout(OPERATION_DEADLINE, resolve(state, None, &key, None))
+        .await
+        .map_err(|_| timeout_error())??;
+    let item = result
+        .items
+        .iter()
+        .find(|item| item.official_set_id == set_id)
+        .filter(|item| item.catalogue_complete)
+        .ok_or_else(invalid)?;
+    let mut metadata = item.native.clone();
+    metadata["download_disabled"] = json!(item.download_disabled);
+    metadata["availability"] =
+        json!({"download_disabled":item.download_disabled,"more_information":null});
+    illya_domain::official_set::OfficialSetMetadata::from_upstream(&metadata, set_id)
+        .map_err(|_| invalid())?;
+    Ok(metadata)
 }
 
 async fn public_result(state: &AppState, key: SearchKey) -> ApiResult<SearchResult> {

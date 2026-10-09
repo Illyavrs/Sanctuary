@@ -12,6 +12,7 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use chrono::{DateTime, Utc};
+use illya_domain::official_set::OfficialSetMetadata;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tower::ServiceExt;
@@ -134,6 +135,8 @@ async fn snapshot(state: &AppState) -> Value {
     let mut result = serde_json::Map::new();
     for (table, order) in [
         ("beatmap_rank_requests", "id"),
+        ("beatmap_catalogue_metadata", "native_set_id"),
+        ("server_catalogue_revision", "singleton"),
         ("beatmap_status_overrides", "native_id"),
         ("beatmaps", "id"),
         ("beatmap_packages", "id"),
@@ -630,10 +633,39 @@ async fn approval_requires_moderation_and_ranks_only_selected_difficulties() {
 }
 
 fn official_metadata(set: i64, status: &str) -> Value {
-    json!({"id":set,"title":"Official rank fixture","artist":"Fixture Artist","creator":"Fixture Creator","status":status,"beatmaps":[
-        {"id":set*10,"beatmapset_id":set,"checksum":format!("{:032x}",set*10),"version":"Easy","mode_int":0,"status":status,"difficulty_rating":1.0,"total_length":120},
-        {"id":set*10+1,"beatmapset_id":set,"checksum":format!("{:032x}",set*10+1),"version":"Hard","mode_int":0,"status":status,"difficulty_rating":4.0,"total_length":120}
-    ]})
+    let ranked = match status {
+        "graveyard" => -2,
+        "wip" => -1,
+        "ranked" => 1,
+        "approved" => 2,
+        "qualified" => 3,
+        "loved" => 4,
+        _ => 0,
+    };
+    let maps = [(set * 10, "Easy", 1.0), (set * 10 + 1, "Hard", 4.0)]
+        .into_iter()
+        .map(|(id, version, stars)| {
+            json!({
+                "id":id,"beatmapset_id":set,"checksum":format!("{id:032x}"),
+                "version":version,"mode_int":0,"mode":"osu","status":status,"ranked":ranked,
+                "difficulty_rating":stars,"total_length":120,"hit_length":110,
+                "bpm":180.0,"ar":8.0,"cs":4.0,"accuracy":7.0,"drain":6.0,"max_combo":432,
+                "count_circles":100,"count_sliders":140,"count_spinners":2,
+                "last_updated":"2026-01-01T00:00:00Z","convert":false
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({
+        "id":set,"title":"Official rank fixture","title_unicode":"",
+        "artist":"Fixture Artist","artist_unicode":"","creator":"Fixture Creator",
+        "status":status,"bpm":180.0,"source":"","tags":"rank fixture","nsfw":false,
+        "submitted_date":"2026-01-01T00:00:00Z","last_updated":"2026-01-01T00:00:00Z",
+        "ranked_date":null,"genre":{"id":1,"name":"Unspecified"},
+        "language":{"id":1,"name":"Unspecified"},"download_disabled":false,"beatmaps":maps
+    });
+    OfficialSetMetadata::from_upstream(&value, set)
+        .expect("complete original ranking metadata fixture");
+    value
 }
 
 async fn create_official(app: &Router, cookie: &str, set: i64) -> (StatusCode, Value) {
@@ -702,6 +734,171 @@ async fn official_nominations_are_global_metadata_only_and_future_imports_keep_s
         assert!(server.set_queries().await.contains(&42));
     }).await;
     fixture.finish(result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; owned disposable PostgreSQL 17"]
+async fn official_approval_publishes_complete_sanitized_catalogue_metadata_with_the_decision() {
+    let server = OfficialServer::start().await;
+    let mut upstream = official_metadata(42, "graveyard");
+    upstream["private_source_field"] = json!("private-source-publication-fixture");
+    upstream["covers"] = json!({"cover":"https://example.invalid/private-source-cover"});
+    server.add_set(42, upstream).await;
+    let fixture = MutationFixture::new("rank_official_publish", server.origin.clone()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result = tokio::spawn(async move {
+        let (_, _, _, owner) = actor(&state, "OfficialPublishOwner", &[REQUEST_PERMISSION]).await;
+        let (_, _, _, staff) = actor(&state, "OfficialPublishStaff", &[REVIEW_PERMISSION, "beatmaps.moderate"]).await;
+        let (status, submitted) = create_official(&app, &owner, 42).await;
+        assert_eq!(status, StatusCode::OK, "{submitted}");
+        let id = created(&submitted, 42, "official");
+        assert_eq!(snapshot(&state).await["beatmap_catalogue_metadata"], json!([]), "a pending nomination is private and does not add public membership");
+        let (status, approved) = decide(&app, &staff, id, "approved", 0, &submitted["difficulties"]).await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+        assert_eq!(approved["status"], "approved");
+        assert_eq!(approved["revision"], 1);
+        assert_eq!(approved["approved_difficulty_ids"], json!([420]));
+        let after = snapshot(&state).await;
+        assert_eq!(after["beatmap_catalogue_metadata"].as_array().unwrap().len(), 1);
+        let row = &after["beatmap_catalogue_metadata"][0];
+        assert_eq!(row["native_set_id"], 42);
+        let published = &row["metadata"];
+        let complete = OfficialSetMetadata::from_upstream(published, 42).expect("published metadata remains a complete original set");
+        assert_eq!(complete.beatmaps.len(), 2, "the unselected original sibling must remain discoverable");
+        assert_eq!(published["status"], "graveyard", "publication retains upstream status separately from the decision");
+        assert_eq!(published["beatmaps"][0]["status"], "graveyard");
+        assert_eq!(published["beatmaps"][1]["status"], "graveyard");
+        assert_eq!(published["beatmaps"][0]["accuracy"], 7.0);
+        assert_eq!(published["beatmaps"][0]["drain"], 6.0);
+        assert_eq!(published["beatmaps"][0]["max_combo"], 432);
+        assert!(published.get("private_source_field").is_none());
+        assert!(!published.to_string().contains("private-source"));
+        assert_eq!(after["beatmap_status_overrides"].as_array().unwrap().len(), 1);
+        assert_eq!(after["beatmap_status_overrides"][0]["native_id"], 420);
+        assert_eq!(after["beatmap_status_overrides"][0]["status"], "ranked");
+        assert_eq!(after["beatmaps"], json!([]));
+        assert_eq!(after["beatmap_packages"], json!([]));
+        assert_eq!(after["lazer_beatmap_updates"], json!([]));
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE target_type='beatmap_rank_request' AND target_id=$1")
+            .bind(id.to_string()).fetch_one(&state.db).await.unwrap();
+        assert_eq!(audits, 2, "submission and approval each publish one audit");
+        let (status, page) = request(&app, "GET", "/api/v1/server/beatmapsets?status=ranked", None, Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["items"][0]["kind"], "official_metadata");
+        let official = &page["items"][0]["official"];
+        assert_eq!(official["official_set_id"], 42);
+        assert_eq!(official["official_status"], "graveyard");
+        assert_eq!(official["metadata_only"], true);
+        assert_eq!(official["difficulties"][0]["status"], "ranked");
+        assert_eq!(official["difficulties"][1]["status"], "graveyard");
+        assert_eq!(official["local"]["archive_available"], false);
+        assert_eq!(snapshot(&state).await, after, "reading the new member cannot import content or republish the decision");
+        assert_eq!(file_count(&state.maps_root).await, 0);
+        assert_eq!(server.counters()[3], 0);
+        assert_eq!(server.set_queries().await, vec![42], "approval shares the complete upstream cache with nomination");
+    }).await;
+    fixture.finish(result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; owned disposable PostgreSQL 17"]
+async fn official_approval_rejects_incomplete_raw_metadata_before_any_decision_is_committed() {
+    for missing in ["accuracy", "submitted_date"] {
+        let server = OfficialServer::start().await;
+        let mut malformed = official_metadata(42, "graveyard");
+        if missing == "accuracy" {
+            malformed["beatmaps"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+        } else {
+            malformed.as_object_mut().unwrap().remove(missing);
+        }
+        assert!(OfficialSetMetadata::from_upstream(&malformed, 42).is_err());
+        server.add_set(42, malformed).await;
+        let fixture =
+            MutationFixture::new(&format!("rank_incomplete_{missing}"), server.origin.clone())
+                .await;
+        let state = fixture.state.clone();
+        let app = fixture.app.clone();
+        let result = tokio::spawn(async move {
+            let (_, _, _, owner) = actor(&state, "OfficialIncompleteOwner", &[REQUEST_PERMISSION]).await;
+            let (_, _, _, staff) = actor(&state, "OfficialIncompleteStaff", &[REVIEW_PERMISSION, "beatmaps.moderate"]).await;
+            let (status, submitted) = create_official(&app, &owner, 42).await;
+            assert_eq!(status, StatusCode::OK, "displayable metadata may support a private nomination: {missing}: {submitted}");
+            let id = created(&submitted, 42, "official");
+            let before = snapshot(&state).await;
+            let (status, value) = decide(&app, &staff, id, "approved", 0, &submitted["difficulties"]).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "incomplete original {missing} must block publication: {value}");
+            assert_eq!(value["error"]["code"], "official_search_invalid");
+            assert_eq!(snapshot(&state).await, before, "malformed metadata cannot change decisions, revisions, overrides, audits or public membership");
+            assert_eq!(stored(&state, id).await["status"], "pending");
+            assert_eq!(stored(&state, id).await["revision"], 0);
+            assert_eq!(before["beatmap_catalogue_metadata"], json!([]));
+            assert_eq!(before["beatmap_status_overrides"], json!([]));
+            assert_eq!(file_count(&state.maps_root).await, 0);
+            assert_eq!(server.counters()[3], 0);
+        }).await;
+        fixture.finish(result).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; owned disposable PostgreSQL 17"]
+async fn official_catalogue_persistence_failure_rolls_back_review_and_direct_status_decisions() {
+    for operation in ["approval", "difficulty"] {
+        let server = OfficialServer::start().await;
+        server.add_set(42, official_metadata(42, "graveyard")).await;
+        let fixture = MutationFixture::new(
+            &format!("rank_publish_rb_{operation}"),
+            server.origin.clone(),
+        )
+        .await;
+        let state = fixture.state.clone();
+        let app = fixture.app.clone();
+        let result = tokio::spawn(async move {
+            let (_, _, _, owner) = actor(&state, "OfficialPersistOwner", &[REQUEST_PERMISSION]).await;
+            let (_, _, _, staff) = actor(&state, "OfficialPersistStaff", &[REVIEW_PERMISSION, "beatmaps.moderate"]).await;
+            let submitted = if operation == "approval" {
+                let (status, value) = create_official(&app, &owner, 42).await;
+                assert_eq!(status, StatusCode::OK, "{value}");
+                value
+            } else { Value::Null };
+            sqlx::query("CREATE FUNCTION fixture_reject_catalogue_metadata() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owned fixture rejects catalogue publication' USING ERRCODE='23514'; END $$")
+                .execute(&state.db).await.unwrap();
+            sqlx::query("CREATE CONSTRAINT TRIGGER fixture_reject_catalogue_metadata AFTER INSERT OR UPDATE ON beatmap_catalogue_metadata DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fixture_reject_catalogue_metadata()")
+                .execute(&state.db).await.unwrap();
+            let before = snapshot(&state).await;
+            let (status, value) = if operation == "approval" {
+                decide(&app, &staff, submitted["id"].as_i64().unwrap(), "approved", 0, &submitted["difficulties"]).await
+            } else {
+                difficulty_patch(&app, &staff, 42, 420, "ranked", 0, None).await
+            };
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{operation}: {value}");
+            assert_eq!(snapshot(&state).await, before, "{operation} cannot commit overrides, ranking requests, audits or a catalogue epoch without durable metadata");
+            assert_eq!(before["beatmap_catalogue_metadata"], json!([]));
+            assert_eq!(before["beatmap_status_overrides"], json!([]));
+            assert_eq!(file_count(&state.maps_root).await, 0);
+            sqlx::query("DROP TRIGGER fixture_reject_catalogue_metadata ON beatmap_catalogue_metadata").execute(&state.db).await.unwrap();
+            sqlx::query("DROP FUNCTION fixture_reject_catalogue_metadata()").execute(&state.db).await.unwrap();
+            let (status, value) = if operation == "approval" {
+                decide(&app, &staff, submitted["id"].as_i64().unwrap(), "approved", 0, &submitted["difficulties"]).await
+            } else {
+                difficulty_patch(&app, &staff, 42, 420, "ranked", 0, None).await
+            };
+            assert_eq!(status, StatusCode::OK, "the same revisions remain valid after confirmed rollback: {operation}: {value}");
+            let after = snapshot(&state).await;
+            assert_eq!(after["beatmap_catalogue_metadata"].as_array().unwrap().len(), 1);
+            assert_eq!(after["beatmap_status_overrides"].as_array().unwrap().len(), 1);
+            assert_eq!(after["beatmap_status_overrides"][0]["status"], "ranked");
+            assert_eq!(after["beatmaps"], json!([]));
+            assert_eq!(file_count(&state.maps_root).await, 0);
+            assert_eq!(server.counters()[3], 0);
+        }).await;
+        fixture.finish(result).await;
+    }
 }
 
 #[tokio::test]

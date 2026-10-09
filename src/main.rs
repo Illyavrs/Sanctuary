@@ -51,6 +51,9 @@ mod relax_tests;
 mod score_recovery;
 mod score_scales;
 mod scores;
+mod server_catalogue;
+#[cfg(test)]
+mod server_catalogue_tests;
 mod social;
 mod website_chat;
 mod website_chat_runtime;
@@ -235,7 +238,9 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
     let limit =
         if path.starts_with("/api/v1/auth/recovery/") || path.starts_with("/api/v1/auth/email/") {
             Some((5, 60, "recovery"))
-        } else if path.starts_with("/api/v1/official/beatmapsets/") {
+        } else if path.starts_with("/api/v1/official/beatmapsets/")
+            || path == "/api/v1/server/beatmapsets"
+        {
             Some((30, 60, "official_discovery"))
         } else if mutating && path.starts_with("/api/v1/auth/") {
             Some((20, 600, "auth"))
@@ -340,6 +345,28 @@ fn router(state: AppState) -> Router {
         ]);
     Router::new()
         .merge(rank_requests::routes())
+        .route(
+            "/api/v1/server/beatmapsets",
+            get(server_catalogue::list).layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            )),
+        )
+        .route(
+            "/api/v1/internal/beatmapsets/catalogue-search",
+            post(server_catalogue::native_search),
+        )
+        .route(
+            "/api/v1/admin/beatmapsets/catalogue-metadata-pending",
+            get(server_catalogue::pending).layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            )),
+        )
+        .route(
+            "/api/v1/admin/beatmapsets/{id}/catalogue-metadata",
+            post(server_catalogue::refresh).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
         .route(
             "/health/live",
             get(|| async { Json(json!({"status":"ok","service":"sanctuary"})) }),
