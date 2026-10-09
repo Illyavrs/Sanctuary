@@ -315,7 +315,7 @@ async fn scoped_rbac_privacy_deletion_revocation_and_queued_authorization() {
             (Method::PATCH, format!("/api/v1/admin/users/{target}"), Some(json!({"roles":[]}))),
             (Method::POST, format!("/api/v1/admin/users/{target}/sessions/revoke"), None),
             (Method::PATCH, "/api/v1/admin/beatmaps/1".to_string(), Some(json!({"status":"ranked"}))),
-            (Method::PATCH, "/api/v1/admin/scores/1".to_string(), Some(json!({"verification":"verified"}))),
+            (Method::PATCH, "/api/v1/admin/scores/1".to_string(), Some(json!({"verification":"verified","expected_revision":0}))),
             (Method::POST, "/api/v1/admin/scores/recalculate-relax".to_string(), Some(json!({"score_ids":[1]}))),
         ];
         for (method, path, body) in mutations {

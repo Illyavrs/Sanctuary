@@ -2,13 +2,12 @@
 #[cfg(test)]
 #[path = "website_chat_tests.rs"]
 mod integration_tests;
-use crate::{ApiError, ApiResult, AppState, auth, page};
+use crate::{ApiError, ApiResult, AppState, auth, chat_moderation, page};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use illya_domain::has_permission;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -229,20 +228,19 @@ async fn conversation(state: &AppState, user: &auth::User, id: i64) -> ApiResult
         .bind(id).bind(user.id).fetch_optional(&state.db).await?;
     let unread: i64 = sqlx::query_scalar("SELECT count(*) FROM chat_messages m JOIN users u ON u.id=m.user_id WHERE m.channel_id=$1 AND m.id>$3 AND m.user_id<>$2 AND NOT u.is_restricted AND NOT EXISTS(SELECT 1 FROM user_relationships r WHERE r.relation_type='block' AND ((r.user_id=$2 AND r.target_id=m.user_id) OR (r.target_id=$2 AND r.user_id=m.user_id)))")
         .bind(id).bind(user.id).bind(last_read).fetch_one(&state.db).await?;
-    let restriction = if !has_permission(&user.permissions, "chat.send") {
-        Some("no_permission")
+    let mut policy_tx = state.db.begin().await?;
+    let status = chat_moderation::sending_status(&mut policy_tx, user).await?;
+    let restriction = if status.send_restriction.is_some() {
+        status.send_restriction
+    } else if friends_only(&mut policy_tx, user.id, peer_id).await? {
+        Some("friend_only")
     } else {
-        let mut tx = state.db.begin().await?;
-        if friends_only(&mut tx, user.id, peer_id).await? {
-            Some("friend_only")
-        } else {
-            None
-        }
+        None
     };
     // Recheck the complete conversation policy after fetching its presentation.
     peer_check(state, user.id, id).await?;
     Ok(
-        json!({"id":id,"peer":peer,"last_message":preview,"last_read_id":last_read,"unread_count":unread,"can_send":restriction.is_none(),"send_restriction":restriction}),
+        json!({"id":id,"peer":peer,"last_message":preview,"last_read_id":last_read,"unread_count":unread,"can_send":restriction.is_none(),"send_restriction":restriction,"silenced_until":status.silenced_until}),
     )
 }
 async fn peer_check(state: &AppState, user: i64, id: i64) -> ApiResult<()> {
@@ -423,6 +421,7 @@ pub(crate) async fn store_message(
         tx.commit().await?;
         return Ok(value);
     }
+    chat_moderation::require_new_message(&mut tx, &actor).await?;
     let message_id: i64 = if let Some(peer) = peer_id {
         send_policy(&mut tx, actor.id, peer).await?;
         let private_id:i64=sqlx::query_scalar("INSERT INTO protocol_private_messages(sender_id,recipient_id,content,is_action,client_uuid) VALUES($1,$2,$3,$4,$5) RETURNING id")

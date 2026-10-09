@@ -8,6 +8,10 @@ use illya_domain::{PERMISSIONS, Pagination, has_permission};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+#[cfg(test)]
+#[path = "score_moderation_tests.rs"]
+mod moderation_tests;
+
 #[derive(Deserialize)]
 pub struct UserDirectoryQuery {
     page: Option<u32>,
@@ -450,6 +454,23 @@ mod tests {
         assert!(can_delegate(&manager, &["users.moderate".into()]).is_err());
         assert!(can_delegate(&["*".into()], &["users.moderate".into()]).is_ok());
     }
+
+    #[test]
+    fn score_review_input_requires_a_revision_and_rejects_unknown_fields() {
+        for value in [
+            json!({"verification":"verified"}),
+            json!({"verification":"verified","expected_revision":0,"actor_id":1}),
+            json!({"verification":"verified","expected_revision":0.5}),
+        ] {
+            assert!(serde_json::from_value::<ScorePatch>(value).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ScorePatch>(
+                json!({"verification":"verified","expected_revision":0})
+            )
+            .is_ok()
+        );
+    }
 }
 #[derive(Deserialize)]
 pub struct MapPatch {
@@ -486,8 +507,10 @@ pub async fn update_map(
     Ok(Json(crate::maps::get_retained(&state, id).await?))
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScorePatch {
     verification: String,
+    expected_revision: i64,
 }
 pub async fn update_score(
     State(state): State<AppState>,
@@ -503,21 +526,46 @@ pub async fn update_score(
     ) {
         return Err(ApiError::bad("Unknown score verification status."));
     }
+    if input.expected_revision < 0 {
+        return Err(ApiError::bad("Score revision must be non-negative."));
+    }
     let mut tx = state.db.begin().await?;
     let user = lock_actor(&mut tx, &user, None).await?;
     user.require("scores.moderate")?;
-    let result = sqlx::query("UPDATE scores SET verification=$2 WHERE id=$1")
+    let previous: Value = sqlx::query_scalar("SELECT jsonb_build_object('verification',verification,'moderation_revision',moderation_revision) FROM scores WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::missing)?;
+    auth::ensure_mutation_actor(&mut tx, &user).await?;
+    if previous["moderation_revision"].as_i64() != Some(input.expected_revision) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "score_moderation_conflict",
+            "This score was reviewed after you loaded it. Refresh before reviewing it again."
+                .into(),
+        ));
+    }
+    if previous["verification"].as_str() == Some(input.verification.as_str()) {
+        // A scores.verify audit itself is a deliberate native publication
+        // decision. Do not create one without advancing the resource revision.
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "score_verification_unchanged",
+            "Choose a different score verification status.".into(),
+        ));
+    }
+    let updated: Value = sqlx::query_scalar("UPDATE scores SET verification=$2 WHERE id=$1 RETURNING jsonb_build_object('verification',verification,'moderation_revision',moderation_revision)")
         .bind(id)
         .bind(&input.verification)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::missing());
-    }
-    sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'scores.verify','score',$2,$3)").bind(user.id).bind(id.to_string()).bind(json!({"verification":input.verification})).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'scores.verify','score',$2,$3)").bind(user.id).bind(id.to_string()).bind(json!({"previous":previous,"new":updated})).execute(&mut *tx).await?;
     auth::ensure_mutation_actor(&mut tx, &user).await?;
     tx.commit().await?;
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(
+        json!({"ok":true,"id":id,"verification":updated["verification"],"moderation_revision":updated["moderation_revision"]}),
+    ))
 }
 pub async fn audit_events(
     State(state): State<AppState>,

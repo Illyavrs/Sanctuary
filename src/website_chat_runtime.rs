@@ -391,7 +391,13 @@ mod tests {
 
     #[test]
     fn policy_notifications_refresh_without_exposing_their_payloads() {
-        for kind in ["join", "part", "read", "channel_policy_changed"] {
+        for kind in [
+            "join",
+            "part",
+            "read",
+            "channel_policy_changed",
+            "chat_policy_changed",
+        ] {
             let event = json!({
                 "schema":"website_fixture", "kind":kind,
                 "user":29, "channel":8, "private":"not sent to a client"

@@ -712,7 +712,7 @@ async fn persistence_and_permissions() {
         Method::PATCH,
         &format!("/api/v1/admin/scores/{score_id}"),
         Some(&cookie),
-        Some(json!({"verification":"verified"})),
+        Some(json!({"verification":"verified","expected_revision":0})),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -805,7 +805,7 @@ async fn persistence_and_permissions() {
             manager_score["id"].as_i64().unwrap()
         ),
         Some(&cookie),
-        Some(json!({"verification":"verified"})),
+        Some(json!({"verification":"verified","expected_revision":0})),
     )
     .await;
     assert_eq!(s, StatusCode::OK);

@@ -11,6 +11,7 @@ mod beatmap_availability_tests;
 #[cfg(test)]
 mod beatmap_filename_tests;
 mod chat;
+mod chat_moderation;
 #[cfg(test)]
 mod chat_visibility_tests;
 #[cfg(test)]
@@ -504,6 +505,7 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/v1/channels/{id}/stream", get(chat::stream))
         .route("/api/v1/chat/stream", get(website_chat_runtime::stream))
+        .route("/api/v1/chat/status", get(chat_moderation::status))
         .route(
             "/api/v1/chat/visibility",
             post(website_chat::visibility).layer(DefaultBodyLimit::max(8 * 1024)),
@@ -526,6 +528,16 @@ fn router(state: AppState) -> Router {
             axum::routing::put(website_chat::mark_read).layer(DefaultBodyLimit::max(8 * 1024)),
         )
         .route("/api/v1/admin/users", get(admin::users))
+        .route(
+            "/api/v1/admin/chat-silences",
+            get(chat_moderation::directory),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/chat-silence",
+            axum::routing::put(chat_moderation::apply)
+                .delete(chat_moderation::lift)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/v1/admin/announcements",
             get(announcements::admin_list)
