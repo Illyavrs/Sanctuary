@@ -24,6 +24,11 @@ pub(crate) mod archive_names;
 #[path = "official_archive.rs"]
 mod official_archive;
 pub use official_archive::import_archive;
+#[path = "official_archive_download.rs"]
+mod official_archive_download;
+pub use official_archive_download::{
+    internal as official_archive_internal, public as official_archive_download,
+};
 #[path = "official_set_metadata.rs"]
 mod official_set_metadata;
 pub use official_set_metadata::metadata;
@@ -57,6 +62,7 @@ pub struct OfficialState {
     resolutions: HashMap<MapSelector, CachedFailure>,
     set_metadata: HashMap<i64, official_set_metadata::CachedMetadata>,
     search_cache: HashMap<official_search::SearchKey, official_search::CachedSearch>,
+    archive_download: official_archive_download::DownloadState,
     public_discovery_slots: Arc<tokio::sync::Semaphore>,
     public_discovery_requests: Vec<Instant>,
     // HTTP spacing and OAuth renewal share this gate. Cached discovery never
@@ -77,6 +83,7 @@ impl Default for OfficialState {
             resolutions: HashMap::new(),
             set_metadata: HashMap::new(),
             search_cache: HashMap::new(),
+            archive_download: Default::default(),
             public_discovery_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             public_discovery_requests: Vec::new(),
             request_gate: Arc::new(Mutex::new(())),

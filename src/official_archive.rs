@@ -139,22 +139,26 @@ async fn read_input(mut multipart: Multipart) -> ApiResult<ArchiveInput> {
     let bytes = bytes
         .filter(|bytes| !bytes.is_empty())
         .ok_or_else(archive_invalid)?;
+    tokio::task::spawn_blocking(move || parse_archive_input(set_id, bytes))
+        .await
+        .map_err(ApiError::internal)?
+}
+
+fn parse_archive_input(set_id: i64, bytes: Vec<u8>) -> ApiResult<ArchiveInput> {
+    if bytes.is_empty() || bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(archive_too_large());
+    }
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    let parsing = bytes.clone();
-    let mut maps = tokio::task::spawn_blocking(move || -> ApiResult<Vec<UploadMap>> {
-        unpack_archive_with_policy(&parsing, true)
-            .map_err(|_| archive_invalid())?
-            .into_iter()
-            .map(|(filename, bytes)| {
-                Ok(UploadMap {
-                    filename,
-                    map: parse_map(bytes).map_err(|_| archive_invalid())?,
-                })
+    let mut maps = unpack_archive_with_policy(&bytes, true)
+        .map_err(|_| archive_invalid())?
+        .into_iter()
+        .map(|(filename, bytes)| {
+            Ok(UploadMap {
+                filename,
+                map: parse_map(bytes).map_err(|_| archive_invalid())?,
             })
-            .collect()
-    })
-    .await
-    .map_err(ApiError::internal)??;
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
     maps.sort_unstable_by(|left, right| left.map.md5.cmp(&right.map.md5));
     let mut ids = HashSet::new();
     for input in &maps {
@@ -182,6 +186,92 @@ async fn read_input(mut multipart: Multipart) -> ApiResult<ArchiveInput> {
         maps,
         manifest,
     })
+}
+
+/// Validate a transient provider response using the same complete original
+/// difficulty manifest as persistent operator imports. This performs no writes.
+pub(super) fn verify_download(bytes: &[u8], set_id: i64, metadata: &Value) -> ApiResult<()> {
+    let input = parse_archive_input(set_id, bytes.to_vec())?;
+    verify_manifest(&input, &metadata_members(metadata, set_id)?)?;
+    verify_referenced_audio(bytes, &input.maps)
+}
+
+fn verify_referenced_audio(bytes: &[u8], maps: &[UploadMap]) -> ApiResult<()> {
+    let mut references = HashSet::new();
+    for input in maps {
+        let text = std::str::from_utf8(&input.map.bytes).map_err(|_| archive_invalid())?;
+        let mut general = false;
+        let mut audio = None;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                general = line == "[General]";
+            } else if general
+                && let Some((key, value)) = line.split_once(':')
+                && key.trim() == "AudioFilename"
+                && audio.replace(value.trim()).is_some()
+            {
+                return Err(archive_invalid());
+            }
+        }
+        let name = audio
+            .filter(|name| !name.is_empty() && name.len() <= 1024)
+            .ok_or_else(archive_invalid)?;
+        // The archive preflight already normalizes separators and rejects
+        // traversal. Apply the same safe relative namespace to audio references.
+        let name = name.replace('\\', "/");
+        if name.starts_with('/')
+            || name.contains(':')
+            || name.contains('\0')
+            || name
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            return Err(archive_invalid());
+        }
+        references.insert(name.to_lowercase());
+    }
+    let entries = archive_names::preflight(bytes)?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| archive_invalid())?;
+    for (index, original) in entries.into_iter().enumerate() {
+        if !references.remove(&original.name.to_lowercase()) {
+            continue;
+        }
+        let mut entry = archive.by_index(index).map_err(|_| archive_invalid())?;
+        if entry.central_header_start() != original.central_start
+            || entry.header_start() != original.header_start
+            || entry.data_start() != original.data_start
+            || entry.compressed_size() != original.compressed_size
+            || entry.size() != original.size
+            || entry.crc32() != original.crc32
+            || original.size == 0
+            || original.size > MAX_ARCHIVE_BYTES as u64
+        {
+            return Err(archive_invalid());
+        }
+        let mut hasher = crc32fast::Hasher::new();
+        let mut count = 0_u64;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = entry.read(&mut buffer).map_err(|_| archive_invalid())?;
+            if read == 0 {
+                break;
+            }
+            count += read as u64;
+            if count > original.size {
+                return Err(archive_invalid());
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if count != original.size || hasher.finalize() != original.crc32 {
+            return Err(archive_invalid());
+        }
+    }
+    if references.is_empty() {
+        Ok(())
+    } else {
+        Err(archive_invalid())
+    }
 }
 
 struct MemberMetadata {

@@ -31,6 +31,8 @@ mod maps;
 #[cfg(test)]
 mod native_map_tests;
 #[cfg(test)]
+mod official_archive_download_tests;
+#[cfg(test)]
 mod official_archive_tests;
 #[cfg(test)]
 mod official_set_metadata_tests;
@@ -465,6 +467,10 @@ fn router(state: AppState) -> Router {
             )),
         )
         .route(
+            "/api/v1/official/beatmapsets/{id}/archive",
+            get(maps::official_archive_download),
+        )
+        .route(
             "/api/v1/beatmaps/{id}/set/difficulties",
             get(map_catalogue::difficulties),
         )
@@ -523,6 +529,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v1/internal/beatmapsets/metadata",
             post(maps::metadata).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/api/v1/internal/beatmapsets/archive",
+            post(maps::official_archive_internal),
         )
         .route(
             "/api/v1/internal/beatmapsets/search",
@@ -687,6 +697,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, _>>()?;
     let origin = env::var("PUBLIC_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".into());
     let mail = Arc::new(mail_delivery::MailConfig::from_env(&origin)?);
+    let mut official = maps::OfficialState::default();
+    official.configure_archive_provider()?;
     let state = AppState {
         db,
         secret: Arc::new(secret),
@@ -701,7 +713,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
-        official: Arc::new(Mutex::new(maps::OfficialState::default())),
+        official: Arc::new(Mutex::new(official)),
         limits: Arc::new(Mutex::new(HashMap::new())),
         trusted_proxies: Arc::new(trusted_proxies),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(2)),

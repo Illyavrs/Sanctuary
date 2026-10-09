@@ -471,6 +471,8 @@ struct Item {
     cover_url: String,
     official_url: String,
     download_disabled: bool,
+    archive_download_available: bool,
+    archive_download_url: Option<String>,
     difficulties: Vec<Difficulty>,
     local: Local,
     #[serde(skip)]
@@ -494,7 +496,7 @@ fn native_result(result: &SearchResult) -> Value {
         .filter(|item| !item.local.withdrawn)
         .map(|item| {
             let mut value = item.native.clone();
-            let disabled = item.download_disabled || !item.local.archive_available;
+            let disabled = !item.archive_download_available;
             value["download_disabled"] = json!(disabled);
             value["availability"] = json!({"download_disabled":disabled,"more_information":null});
             value
@@ -943,9 +945,9 @@ fn transform(value: &Value) -> ApiResult<SearchResult> {
                 .then(a.official_id.cmp(&b.official_id))
         });
         let download_disabled = match set.get("availability") {
-            None | Some(Value::Null) => false,
+            None | Some(Value::Null) => true,
             Some(Value::Object(value)) => match value.get("download_disabled") {
-                None => false,
+                None => true,
                 Some(value) => value.as_bool().ok_or_else(invalid)?,
             },
             _ => return Err(invalid()),
@@ -973,6 +975,8 @@ fn transform(value: &Value) -> ApiResult<SearchResult> {
             cover_url: format!("https://assets.ppy.sh/beatmaps/{set_id}/covers/card.jpg"),
             official_url: format!("https://osu.ppy.sh/beatmapsets/{set_id}"),
             download_disabled,
+            archive_download_available: false,
+            archive_download_url: None,
             difficulties,
             local: Local::default(),
             native,
@@ -1154,6 +1158,7 @@ async fn resolve(
     result
 }
 async fn merge_local(state: &AppState, result: &mut SearchResult) -> ApiResult<()> {
+    let provider_configured = official_archive_download::configured(state).await;
     let ids = result
         .items
         .iter()
@@ -1263,6 +1268,25 @@ async fn merge_local(state: &AppState, result: &mut SearchResult) -> ApiResult<(
             item.native["status"] = json!(status);
             item.native["ranked"] = json!(status_rank(status));
         }
+    }
+    for item in &mut result.items {
+        item.archive_download_available = !item.local.withdrawn
+            && (item.local.archive_available || (provider_configured && !item.download_disabled));
+        item.archive_download_url = if !item.archive_download_available {
+            None
+        } else if let Some(id) = item
+            .difficulties
+            .iter()
+            .find(|map| map.archive_available)
+            .and_then(|map| map.local_id)
+        {
+            Some(format!("/api/v1/beatmaps/{id}/archive"))
+        } else {
+            Some(format!(
+                "/api/v1/official/beatmapsets/{}/archive",
+                item.official_set_id
+            ))
+        };
     }
     Ok(())
 }

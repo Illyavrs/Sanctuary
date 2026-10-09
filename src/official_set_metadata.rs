@@ -86,8 +86,19 @@ pub async fn metadata(
     require_service_key(&state, &headers)?;
     require_active_user(&state, input.user_id).await?;
     availability::require_active_set(&state.db, input.official_set_id).await?;
+    let mut value = result?;
+    let retained: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM official_beatmapset_archives WHERE official_set_id=$1)",
+    )
+    .bind(input.official_set_id)
+    .fetch_one(&state.db)
+    .await?;
+    value.archive_download_available = retained
+        || (!value.download_disabled && official_archive_download::configured(&state).await);
+    require_active_user(&state, input.user_id).await?;
+    availability::require_active_set(&state.db, input.official_set_id).await?;
     Ok(Json(
-        serde_json::to_value(result?).map_err(ApiError::internal)?,
+        serde_json::to_value(value).map_err(ApiError::internal)?,
     ))
 }
 
@@ -235,6 +246,18 @@ async fn fetch_metadata(state: &AppState, set_id: i64) -> ApiResult<OfficialSetM
             "The official set metadata was invalid.",
         )
     })
+}
+
+/// Fresh read-only policy/manifest retrieval for transient downloads. Unlike
+/// card discovery this intentionally does not use the five-minute cache.
+pub(super) async fn download_metadata(
+    state: &AppState,
+    set_id: i64,
+) -> ApiResult<OfficialSetMetadata> {
+    availability::require_active_set(&state.db, set_id).await?;
+    let result = fetch_metadata(state, set_id).await;
+    availability::require_active_set(&state.db, set_id).await?;
+    result
 }
 
 async fn remember_failure(state: &AppState, set_id: i64, error: &ApiError) {
