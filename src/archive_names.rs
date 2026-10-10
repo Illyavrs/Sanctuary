@@ -14,7 +14,7 @@ const END: u32 = 0x0605_4b50;
 const ZIP64_END: u32 = 0x0606_4b50;
 const ZIP64_LOCATOR: u32 = 0x0706_4b50;
 
-pub(super) struct ArchiveEntry {
+pub(crate) struct ArchiveEntry {
     pub name: String,
     pub central_start: u64,
     pub header_start: u64,
@@ -422,7 +422,7 @@ fn descriptor_end(bytes: &[u8], at: usize, entry: &ArchiveEntry, wide: bool) -> 
     }
 }
 
-pub(super) fn preflight(bytes: &[u8]) -> ApiResult<Vec<ArchiveEntry>> {
+pub(crate) fn preflight(bytes: &[u8]) -> ApiResult<Vec<ArchiveEntry>> {
     let directory = directory(bytes)?;
     let mut entries = Vec::with_capacity(directory.count);
     let mut paths = HashSet::new();

@@ -2,6 +2,10 @@
 use crate::{
     AppState, Router,
     maps::map_mutation_tests::{MULTIPART, MutationFixture, actor, multipart, osu_bytes, request},
+    maps::map_package_tests::{
+        assert_canonical_archive, assert_canonical_osu,
+        assert_original_files_and_declared_derivatives, files_snapshot,
+    },
 };
 use axum::{
     body::{Body, to_bytes},
@@ -134,6 +138,9 @@ fn assert_difficulty(value: &Value) {
         &[
             "id",
             "native_id",
+            "native_set_id",
+            "official_id",
+            "official_set_id",
             "title",
             "artist",
             "creator",
@@ -148,6 +155,20 @@ fn assert_difficulty(value: &Value) {
         ],
     );
     assert!(value["native_id"].as_i64().is_some_and(|id| id > 0));
+    assert!(value["native_set_id"].as_i64().is_some_and(|id| id > 0));
+    for field in [
+        "md5",
+        "osu_path",
+        "archive_path",
+        "uploaded_by",
+        "local_package_id",
+        "member_md5",
+    ] {
+        assert!(
+            value.get(field).is_none(),
+            "private difficulty field {field}"
+        );
+    }
 }
 fn assert_public_map(value: &Value) {
     assert!(value.get("osu_path").is_none());
@@ -161,6 +182,30 @@ fn assert_public_map(value: &Value) {
 async fn snapshot(state: &AppState) -> Value {
     sqlx::query_scalar("SELECT jsonb_build_object('maps',(SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY id),'[]'::jsonb) FROM beatmaps b),'packages',(SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY id),'[]'::jsonb) FROM beatmap_packages p),'availability',(SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY native_set_id),'[]'::jsonb) FROM beatmapset_availability a),'archives',(SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY official_set_id),'[]'::jsonb) FROM official_beatmapset_archives a),'audits',(SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY id),'[]'::jsonb) FROM audit_events a),'updates',(SELECT COALESCE(jsonb_agg(to_jsonb(u) ORDER BY id),'[]'::jsonb) FROM lazer_beatmap_updates u))")
         .fetch_one(&state.db).await.unwrap()
+}
+
+fn assert_only_distribution_updates(before: &Value, after: &Value, set_ids: &[i64]) {
+    let original_updates = before["updates"].as_array().unwrap();
+    let updates = after["updates"].as_array().unwrap();
+    assert_eq!(&updates[..original_updates.len()], original_updates);
+    assert_eq!(updates.len(), original_updates.len() + set_ids.len());
+    let mut actual_sets = updates[original_updates.len()..]
+        .iter()
+        .map(|row| row["beatmap_set_id"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    let mut expected_sets = set_ids.to_vec();
+    actual_sets.sort_unstable();
+    expected_sets.sort_unstable();
+    assert_eq!(
+        actual_sets, expected_sets,
+        "one cursor event per new canonical package"
+    );
+    let mut expected = before.clone();
+    expected["updates"] = after["updates"].clone();
+    assert_eq!(
+        after, &expected,
+        "all original rows and historical events stay unchanged"
+    );
 }
 
 #[tokio::test]
@@ -845,6 +890,7 @@ async fn catalogue_preserves_standalone_and_archive_download_truth() {
             .collect::<Vec<_>>();
         let archive_set = uploaded["package"]["native_set_id"].as_i64().unwrap();
         let before = snapshot(&state).await;
+        let original_files = files_snapshot(&state.maps_root).await;
         let catalogue_page = catalogue(&app, &[]).await;
         for (id, kind, count, content) in [
             (single_id, "osu", 1, &single_bytes),
@@ -869,15 +915,58 @@ async fn catalogue_preserves_standalone_and_archive_download_truth() {
             let (status, download) =
                 get_bytes(&app, representative["download_url"].as_str().unwrap(), None).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(&download, content);
+            if kind == "osz" {
+                assert_canonical_archive(&state, content, &download).await;
+            } else {
+                assert_canonical_osu(&state, id, content, &download).await;
+            }
         }
-        assert_eq!(
-            snapshot(&state).await,
-            before,
-            "catalogue and downloads are read-only"
+        assert_only_distribution_updates(
+            &before,
+            &snapshot(&state).await,
+            &[
+                single["package"]["native_set_id"].as_i64().unwrap(),
+                archive_set,
+            ],
         );
-        sqlx::query("DELETE FROM beatmaps WHERE id=$1")
+        assert_original_files_and_declared_derivatives(&state, &original_files).await;
+        let published_before = snapshot(&state).await;
+        let published_files = files_snapshot(&state.maps_root).await;
+        let error = sqlx::query("DELETE FROM beatmaps WHERE id=$1")
             .bind(package_ids[1])
+            .execute(&state.db)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23503"),
+            "a published canonical distribution retains its difficulty identities"
+        );
+        assert_eq!(snapshot(&state).await, published_before);
+        assert_eq!(files_snapshot(&state.maps_root).await, published_files);
+
+        // Historical orphan charts predate derivative publication. Their full
+        // retained archive still describes all uploaded bytes; live pagination
+        // counts only difficulties with a surviving canonical identity.
+        let orphan_easy = osu_bytes("Catalogue archived history");
+        let orphan_hard = String::from_utf8(orphan_easy.clone())
+            .unwrap()
+            .replace("Version:Easy", "Version:Hard")
+            .into_bytes();
+        let orphan_archive = archive(&[("Easy.osu", &orphan_easy), ("Hard.osu", &orphan_hard)]);
+        let orphan = upload(&app, &cookie, "historical.osz", &orphan_archive).await;
+        let orphan_ids = orphan["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|map| map["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let orphan_set = orphan["package"]["native_set_id"].as_i64().unwrap();
+        sqlx::query("DELETE FROM beatmaps WHERE id=$1")
+            .bind(orphan_ids[1])
             .execute(&state.db)
             .await
             .unwrap();
@@ -886,7 +975,7 @@ async fn catalogue_preserves_standalone_and_archive_download_truth() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|set| set["native_set_id"] == archive_set)
+            .find(|set| set["native_set_id"] == orphan_set)
             .unwrap();
         assert_eq!(set["stored_count"], 1);
         assert_eq!(set["matching_count"], 1);
@@ -895,25 +984,27 @@ async fn catalogue_preserves_standalone_and_archive_download_truth() {
             "retained archive manifest still describes its complete bytes"
         );
         assert_eq!(set["representative"]["download_kind"], "osz");
-        assert_eq!(
-            get_bytes(
-                &app,
-                set["representative"]["download_url"].as_str().unwrap(),
-                None
-            )
-            .await
-            .1,
-            bytes
-        );
+        let orphan_before = snapshot(&state).await;
+        let orphan_files = files_snapshot(&state.maps_root).await;
+        let (status, downloaded) = get_bytes(
+            &app,
+            set["representative"]["download_url"].as_str().unwrap(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_canonical_archive(&state, &orphan_archive, &downloaded).await;
+        assert_only_distribution_updates(&orphan_before, &snapshot(&state).await, &[orphan_set]);
+        assert_original_files_and_declared_derivatives(&state, &orphan_files).await;
         assert_page(
             &get(
                 &app,
-                &format!("/api/v1/beatmaps/{}/set/difficulties", package_ids[0]),
+                &format!("/api/v1/beatmaps/{}/set/difficulties", orphan_ids[0]),
                 None,
             )
             .await
             .1,
-            &[package_ids[0]],
+            &[orphan_ids[0]],
             "id",
             1,
             1,

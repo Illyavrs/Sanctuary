@@ -5,6 +5,10 @@ use crate::{
         MULTIPART, MutationFixture, actor, file_count, multipart, osu_bytes,
         reject_audits_at_commit, request, wait_for_lock,
     },
+    maps::map_package_tests::{
+        assert_canonical_archive, assert_canonical_osu,
+        assert_original_files_and_declared_derivatives,
+    },
     native_map_tests::{OfficialMap, OfficialServer},
 };
 use axum::{
@@ -59,6 +63,58 @@ async fn resolve_filename(app: &Router, user: i64, filename: &str) -> (StatusCod
             .into_bytes(),
     )
     .await
+}
+
+async fn resolve_checksum(app: &Router, user: i64, checksum: &str) -> (StatusCode, Value) {
+    request(
+        app,
+        RESOLVE_PATH,
+        None,
+        true,
+        "application/json",
+        json!({"user_id":user,"checksum":checksum})
+            .to_string()
+            .into_bytes(),
+    )
+    .await
+}
+
+async fn assert_source_and_derived_resolution(
+    app: &Router,
+    user: i64,
+    filename: &str,
+    id: i64,
+    original: &str,
+    derived: &str,
+) {
+    let (status, filename_value) = resolve_filename(app, user, filename).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_public_resolution(&filename_value, id, original, "local");
+    for checksum in [original, derived] {
+        let (status, value) = resolve_checksum(app, user, checksum).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_public_resolution(&value, id, original, "local");
+        assert_eq!(
+            value, filename_value,
+            "filename, source and delivered checksum share one authority"
+        );
+    }
+    let (status, bytes) = get_bytes(app, &format!("/api/v1/beatmaps/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let public: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(public["id"], id);
+    assert_eq!(
+        public["md5"], derived,
+        "public map uses the checksum of the actual download"
+    );
+    for field in [
+        "native_id",
+        "native_set_id",
+        "official_id",
+        "official_set_id",
+    ] {
+        assert_eq!(public[field], filename_value[field]);
+    }
 }
 
 async fn get_bytes(app: &Router, path: &str) -> (StatusCode, Vec<u8>) {
@@ -246,10 +302,12 @@ async fn local_standalone_filenames_preserve_case_unicode_and_current_map_author
             let (status, downloaded) =
                 get_bytes(&app, &format!("/api/v1/beatmaps/{id}/download")).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(downloaded, bytes);
+            let derived = assert_canonical_osu(&state, id, &bytes, &downloaded).await;
+            assert_source_and_derived_resolution(&app, user, filename, id, &checksum, &derived)
+                .await;
         }
         assert_eq!(snapshot(&state).await, before);
-        assert_eq!(files_snapshot(&state.maps_root).await, files);
+        assert_original_files_and_declared_derivatives(&state, &files).await;
         assert_eq!(
             server.counters(),
             [0; 4],
@@ -290,13 +348,19 @@ async fn archive_basenames_bind_their_actual_difficulty_after_checksum_sorting()
             let (status, resolved) = resolve_filename(&app, user, filename).await;
             assert_eq!(status, StatusCode::OK, "{resolved}");
             assert_public_resolution(&resolved, id, &checksum, "local");
+        }
+        for (filename, raw) in [(easy_name, &easy), (hard_name, &hard)] {
+            let checksum = format!("{:x}", md5::compute(raw));
+            let id = map_id(&value, &checksum);
             let (status, downloaded) =
                 get_bytes(&app, &format!("/api/v1/beatmaps/{id}/download")).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(downloaded, bytes);
+            assert_canonical_archive(&state, &bytes, &downloaded).await;
             let (status, downloaded) = get_bytes(&app, &format!("/api/v1/beatmaps/{id}/osu")).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(downloaded, *raw);
+            let derived = assert_canonical_osu(&state, id, raw, &downloaded).await;
+            assert_source_and_derived_resolution(&app, user, filename, id, &checksum, &derived)
+                .await;
         }
         for path in [
             "z-folder/Hard & +% [Hard].osu",
@@ -306,7 +370,7 @@ async fn archive_basenames_bind_their_actual_difficulty_after_checksum_sorting()
             assert!(alias_ids(&state, path).await.is_empty());
         }
         assert_eq!(snapshot(&state).await, before);
-        assert_eq!(files_snapshot(&state.maps_root).await, files);
+        assert_original_files_and_declared_derivatives(&state, &files).await;
         assert_eq!(server.counters(), [0; 4]);
     })
     .await;
@@ -335,6 +399,7 @@ async fn cp932_archive_aliases_preserve_unicode_original_bytes_and_exact_retry()
         let before = snapshot(&state).await;
         let files = files_snapshot(&state.maps_root).await;
         assert_eq!(before.aliases.as_array().unwrap().len(), 2);
+        let mut delivered_identities = Vec::new();
         for (filename, raw) in [("ソ.osu", &easy), ("星.osu", &hard)] {
             let checksum = format!("{:x}", md5::compute(raw));
             let id = map_id(&created, &checksum);
@@ -342,28 +407,43 @@ async fn cp932_archive_aliases_preserve_unicode_original_bytes_and_exact_retry()
             let (status, resolved) = resolve_filename(&app, user, filename).await;
             assert_eq!(status, StatusCode::OK, "{resolved}");
             assert_public_resolution(&resolved, id, &checksum, "local");
-            assert_eq!(
-                get_bytes(&app, &format!("/api/v1/beatmaps/{id}/download")).await,
-                (StatusCode::OK, bytes.clone())
-            );
-            assert_eq!(
-                get_bytes(&app, &format!("/api/v1/beatmaps/{id}/osu")).await,
-                (StatusCode::OK, raw.clone())
-            );
         }
+        for (filename, raw) in [("ソ.osu", &easy), ("星.osu", &hard)] {
+            let checksum = format!("{:x}", md5::compute(raw));
+            let id = map_id(&created, &checksum);
+            let (status, downloaded) =
+                get_bytes(&app, &format!("/api/v1/beatmaps/{id}/download")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_canonical_archive(&state, &bytes, &downloaded).await;
+            let (status, downloaded) = get_bytes(&app, &format!("/api/v1/beatmaps/{id}/osu")).await;
+            assert_eq!(status, StatusCode::OK);
+            let derived = assert_canonical_osu(&state, id, raw, &downloaded).await;
+            assert_source_and_derived_resolution(&app, user, filename, id, &checksum, &derived)
+                .await;
+            delivered_identities.push((id, derived));
+        }
+        assert_original_files_and_declared_derivatives(&state, &files).await;
+        let distributed_files = files_snapshot(&state.maps_root).await;
         let (status, retried) = upload(&app, &cookie, "renamed.osz", &bytes).await;
         assert_eq!(status, StatusCode::OK, "{retried}");
         assert_eq!(retried["idempotent"], true);
         assert_eq!(retried["package"], created["package"]);
-        for raw in [&easy, &hard] {
-            let checksum = format!("{:x}", md5::compute(raw));
-            assert_eq!(map_id(&retried, &checksum), map_id(&created, &checksum));
+        for (id, derived) in delivered_identities {
+            assert_eq!(
+                map_id(&retried, &derived),
+                id,
+                "retry keeps canonical ID and preferred delivered checksum"
+            );
         }
         assert!(alias_ids(&state, "É».osu").await.is_empty());
         assert!(alias_ids(&state, "cp932.osz").await.is_empty());
         assert!(alias_ids(&state, "renamed.osz").await.is_empty());
         assert_eq!(snapshot(&state).await, before);
-        assert_eq!(files_snapshot(&state.maps_root).await, files);
+        assert_eq!(
+            files_snapshot(&state.maps_root).await,
+            distributed_files,
+            "retry preserves originals and published derivatives"
+        );
         assert_eq!(server.counters(), [0; 4]);
     })
     .await;

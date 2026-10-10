@@ -593,6 +593,56 @@ async fn server_catalogue_upload_filters_exclude_metadata_only_members() {
 
 #[tokio::test]
 #[ignore = "requires ILLYA_TEST_DATABASE_URL; owned disposable PostgreSQL 17"]
+async fn server_catalogue_explicit_uploaded_scope_excludes_retained_official_and_unowned_rows() {
+    let fixture = MutationFixture::new("explicit_uploaded", "http://127.0.0.1:1".into()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result = tokio::spawn(async move {
+        let (owner, _, _, _) = actor(&state, "UploadedScopeOwner", &[]).await;
+        let map = difficulty(100, 1000, "Retained original", 0, "ranked");
+        publish_metadata(&state, &metadata(100, "ranked", vec![map.clone()])).await;
+        // Imported content can have an uploader but keeps its official source.
+        // Set that immutable attribution at insertion, as the import path does.
+        sqlx::query("INSERT INTO beatmaps(uploaded_by,official_id,official_set_id,title,artist,creator,version,mode,status,source,stars,length_seconds,bpm,max_combo,md5,osu_path,created_at) VALUES($1,$2,100,'Retained content title','Fixture Artist','Fixture Creator',$3,0,'ranked','official',2.5,120,180,432,$4,'private-catalogue-fixture.osu','2026-01-01T00:00:00Z'::timestamptz)")
+            .bind(owner)
+            .bind(map["id"].as_i64().unwrap())
+            .bind(map["version"].as_str().unwrap())
+            .bind(map["checksum"].as_str().unwrap())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let owned_set = store_local(&state, owner, 9401).await;
+        let unowned_set: i64 = sqlx::query_scalar("INSERT INTO beatmaps(title,artist,creator,version,mode,status,source,stars,md5,osu_path) VALUES('Legacy local row','Fixture','Fixture','Unowned',0,'ranked','local',2.5,'94949494949494949494949494949494','private-unowned-catalogue-fixture.osu') RETURNING native_set_id")
+            .fetch_one(&state.db).await.unwrap();
+        let before = snapshot(&state).await;
+        assert_page(
+            &catalogue(&app, &[("source", "local"), ("uploaded_only", "true")]).await,
+            &[owned_set],
+            1,
+            1,
+            24,
+        );
+        let uploaded = native_page(&app, owner, "source=local&s=ranked").await;
+        assert_eq!(native_ids(&uploaded), vec![owned_set]);
+        assert_eq!(uploaded["total"], 1);
+        assert_eq!(uploaded["beatmapsets"][0]["metadata_only"], false);
+        let broad = native_page(&app, owner, "s=ranked").await;
+        let mut ids = native_ids(&broad);
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![100, owned_set.min(unowned_set), owned_set.max(unowned_set)]
+        );
+        assert_eq!(broad["total"], 3);
+        assert_eq!(catalogue(&app, &[("source", "official")]).await["total"], 1);
+        assert_eq!(snapshot(&state).await, before);
+    })
+    .await;
+    fixture.finish(result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; owned disposable PostgreSQL 17"]
 async fn server_catalogue_native_guards_and_unsupported_filters_do_not_mutate_authority() {
     let fixture = MutationFixture::new("effective_guards", "http://127.0.0.1:1".into()).await;
     let state = fixture.state.clone();

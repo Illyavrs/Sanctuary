@@ -21,7 +21,7 @@ pub(crate) struct Filter {
 
 // Both previews and the full set selector use the existing compact difficulty
 // shape. Package truth is carried only by the representative's public DTO.
-const DIFFICULTY: &str = "jsonb_build_object('id',b.id,'native_id',b.native_id,'title',b.title,'artist',b.artist,'creator',b.creator,\
+const DIFFICULTY: &str = "jsonb_build_object('id',b.id,'native_id',b.native_id,'native_set_id',b.native_set_id,'official_id',b.official_id,'official_set_id',b.official_set_id,'title',b.title,'artist',b.artist,'creator',b.creator,\
     'version',b.version,'mode',b.mode,'status',b.status,'source',b.source,'stars',b.stars,\
     'length_seconds',b.length_seconds,'bpm',b.bpm,'max_combo',b.max_combo)";
 

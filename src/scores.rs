@@ -78,7 +78,7 @@ pub async fn best_for_user(
             SELECT id,username FROM users WHERE id=$1 AND NOT is_restricted
         ),eligible AS (
             SELECT s.*,u.username,b.title,b.version,b.artist,
-                b.official_set_id beatmapset_id,b.stars,b.max_combo beatmap_max_combo
+                b.official_set_id beatmapset_id,b.source beatmap_source,b.native_id native_beatmap_id,b.native_set_id native_beatmapset_id,b.mode beatmap_mode,b.stars,b.max_combo beatmap_max_combo
             FROM scores s JOIN public_player u ON u.id=s.user_id
             JOIN active_beatmaps b ON b.id=s.beatmap_id
             WHERE s.mode=$2 AND s.score_variant=$3 AND s.verification='verified'
@@ -164,7 +164,7 @@ pub async fn list(
     let all = moderator;
     let total:i64=sqlx::query_scalar("SELECT count(*) FROM scores s JOIN users u ON u.id=s.user_id WHERE ($1::bigint IS NULL OR user_id=$1) AND ($2::bigint IS NULL OR beatmap_id=$2) AND ($3::smallint IS NULL OR mode=$3) AND ($4::text IS NULL OR verification=$4) AND (verification='verified' OR user_id=$5 OR $6) AND (NOT u.is_restricted OR $6) AND ($7::text IS NULL OR s.score_variant=$7)")
         .bind(query.user_id).bind(query.beatmap_id).bind(mode).bind(&query.verification).bind(own_id).bind(all).bind(variant.map(ScoreVariant::as_str)).fetch_one(&state.db).await?;
-    let mut items=sqlx::query_scalar::<_,Value>("WITH paged AS MATERIALIZED (SELECT s.*,u.username,b.title,b.version,b.artist,b.official_set_id beatmapset_id,b.stars,b.max_combo beatmap_max_combo FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id WHERE ($1::bigint IS NULL OR user_id=$1) AND ($2::bigint IS NULL OR beatmap_id=$2) AND ($3::smallint IS NULL OR s.mode=$3) AND ($4::text IS NULL OR verification=$4) AND (verification='verified' OR user_id=$5 OR $6) AND (NOT u.is_restricted OR $6) AND ($9::text IS NULL OR s.score_variant=$9) ORDER BY s.created_at DESC,s.id DESC LIMIT $7 OFFSET $8) SELECT to_jsonb(p)-'replay_path'-'ingestion_key' || jsonb_build_object('has_replay',p.replay_path IS NOT NULL,'accuracy_source',CASE WHEN p.client='lazer' THEN 'client_reported' ELSE 'judgements' END,'grade',COALESCE(p.native_submission->>'rank',t.submission->>'rank',a.details->>'rank')) FROM paged p LEFT JOIN LATERAL(SELECT submission FROM lazer_score_tokens WHERE score_id=p.id ORDER BY id DESC LIMIT 1)t ON true LEFT JOIN LATERAL(SELECT details FROM audit_events WHERE action='scores.stable_ingest' AND target_id=p.id::text ORDER BY id DESC LIMIT 1)a ON true ORDER BY p.created_at DESC,p.id DESC")
+    let mut items=sqlx::query_scalar::<_,Value>("WITH paged AS MATERIALIZED (SELECT s.*,u.username,b.title,b.version,b.artist,b.official_set_id beatmapset_id,b.source beatmap_source,b.native_id native_beatmap_id,b.native_set_id native_beatmapset_id,b.mode beatmap_mode,b.stars,b.max_combo beatmap_max_combo FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id WHERE ($1::bigint IS NULL OR user_id=$1) AND ($2::bigint IS NULL OR beatmap_id=$2) AND ($3::smallint IS NULL OR s.mode=$3) AND ($4::text IS NULL OR verification=$4) AND (verification='verified' OR user_id=$5 OR $6) AND (NOT u.is_restricted OR $6) AND ($9::text IS NULL OR s.score_variant=$9) ORDER BY s.created_at DESC,s.id DESC LIMIT $7 OFFSET $8) SELECT to_jsonb(p)-'replay_path'-'ingestion_key' || jsonb_build_object('has_replay',p.replay_path IS NOT NULL,'accuracy_source',CASE WHEN p.client='lazer' THEN 'client_reported' ELSE 'judgements' END,'grade',COALESCE(p.native_submission->>'rank',t.submission->>'rank',a.details->>'rank')) FROM paged p LEFT JOIN LATERAL(SELECT submission FROM lazer_score_tokens WHERE score_id=p.id ORDER BY id DESC LIMIT 1)t ON true LEFT JOIN LATERAL(SELECT details FROM audit_events WHERE action='scores.stable_ingest' AND target_id=p.id::text ORDER BY id DESC LIMIT 1)a ON true ORDER BY p.created_at DESC,p.id DESC")
         .bind(query.user_id).bind(query.beatmap_id).bind(mode).bind(query.verification).bind(own_id).bind(all).bind(size).bind(offset).bind(variant.map(ScoreVariant::as_str)).fetch_all(&state.db).await?;
     items.iter_mut().for_each(normalize_score_grade);
     let mut response = page(items, total, p, size).0;
@@ -182,7 +182,7 @@ pub async fn detail(
         .as_ref()
         .is_some_and(|user| has_permission(&user.permissions, "scores.moderate"));
     let own_id = viewer.map(|user| user.id);
-    let mut value=sqlx::query_scalar::<_,Value>("SELECT to_jsonb(s)-'replay_path'-'ingestion_key' || jsonb_build_object('username',u.username,'title',b.title,'version',b.version,'artist',b.artist,'beatmapset_id',b.official_set_id,'stars',b.stars,'beatmap_max_combo',b.max_combo,'grade',COALESCE(s.native_submission->>'rank',t.submission->>'rank',a.details->>'rank'),'has_replay',s.replay_path IS NOT NULL,'accuracy_source',CASE WHEN s.client='lazer' THEN 'client_reported' ELSE 'judgements' END,'replay_url',CASE WHEN s.replay_path IS NOT NULL THEN '/api/v1/scores/'||s.id||'/replay' ELSE NULL END,'user',jsonb_build_object('id',u.id,'username',u.username,'country',u.country,'avatar_url',u.avatar_url),'beatmap',to_jsonb(b)-'osu_path'-'archive_path') FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id LEFT JOIN LATERAL(SELECT submission FROM lazer_score_tokens WHERE score_id=s.id ORDER BY id DESC LIMIT 1)t ON true LEFT JOIN LATERAL(SELECT details FROM audit_events WHERE action='scores.stable_ingest' AND target_id=s.id::text ORDER BY id DESC LIMIT 1)a ON true WHERE s.id=$1 AND (s.verification='verified' OR s.user_id=$2 OR $3) AND (NOT u.is_restricted OR $3)").bind(id).bind(own_id).bind(moderator).fetch_optional(&state.db).await?.ok_or_else(ApiError::missing)?;
+    let mut value=sqlx::query_scalar::<_,Value>("SELECT to_jsonb(s)-'replay_path'-'ingestion_key' || jsonb_build_object('username',u.username,'title',b.title,'version',b.version,'artist',b.artist,'beatmapset_id',b.official_set_id,'beatmap_source',b.source,'native_beatmap_id',b.native_id,'native_beatmapset_id',b.native_set_id,'beatmap_mode',b.mode,'stars',b.stars,'beatmap_max_combo',b.max_combo,'grade',COALESCE(s.native_submission->>'rank',t.submission->>'rank',a.details->>'rank'),'has_replay',s.replay_path IS NOT NULL,'accuracy_source',CASE WHEN s.client='lazer' THEN 'client_reported' ELSE 'judgements' END,'replay_url',CASE WHEN s.replay_path IS NOT NULL THEN '/api/v1/scores/'||s.id||'/replay' ELSE NULL END,'user',jsonb_build_object('id',u.id,'username',u.username,'country',u.country,'avatar_url',u.avatar_url),'beatmap',to_jsonb(b)-'osu_path'-'archive_path') FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id LEFT JOIN LATERAL(SELECT submission FROM lazer_score_tokens WHERE score_id=s.id ORDER BY id DESC LIMIT 1)t ON true LEFT JOIN LATERAL(SELECT details FROM audit_events WHERE action='scores.stable_ingest' AND target_id=s.id::text ORDER BY id DESC LIMIT 1)a ON true WHERE s.id=$1 AND (s.verification='verified' OR s.user_id=$2 OR $3) AND (NOT u.is_restricted OR $3)").bind(id).bind(own_id).bind(moderator).fetch_optional(&state.db).await?.ok_or_else(ApiError::missing)?;
     normalize_score_grade(&mut value);
     Ok(Json(value))
 }
@@ -386,6 +386,8 @@ pub struct Submission {
     pub(crate) hit_counts: HitCounts,
     pub(crate) client: Option<String>,
     pub(crate) ingestion_key: Option<String>,
+    #[serde(default)]
+    pub(crate) client_beatmap_md5: Option<String>,
 }
 fn passed_default() -> bool {
     true
@@ -419,7 +421,7 @@ pub fn accuracy(mode: i16, h: &HitCounts) -> ApiResult<f64> {
 async fn ingest(
     state: &AppState,
     user_id: i64,
-    input: Submission,
+    mut input: Submission,
     client: &str,
     website: Option<&auth::User>,
 ) -> ApiResult<Value> {
@@ -435,6 +437,14 @@ async fn ingest(
         return Err(ApiError::bad(
             "Native context requires internal lazer ingestion.",
         ));
+    }
+    if input.client_beatmap_md5.is_some() && !matches!(client, "stable" | "lazer") {
+        return Err(ApiError::bad(
+            "Client beatmap checksums require native ingestion.",
+        ));
+    }
+    if let Some(checksum) = &mut input.client_beatmap_md5 {
+        *checksum = normalized_client_checksum(Some(checksum), "")?;
     }
     score_scales::validate_native_binding(&input)?;
     let (variant, pp_eligible) = mod_partition(&input, client)?;
@@ -485,12 +495,16 @@ async fn ingest(
     if !valid {
         return Err(ApiError::unauthorized());
     }
-    let map = sqlx::query("SELECT osu_path,mode,max_combo,native_set_id FROM beatmaps WHERE id=$1")
-        .bind(input.beatmap_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(ApiError::missing)?;
+    let map =
+        sqlx::query("SELECT osu_path,mode,max_combo,native_set_id,md5 FROM beatmaps WHERE id=$1")
+            .bind(input.beatmap_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(ApiError::missing)?;
     let native_set_id: i64 = map.get("native_set_id");
+    let original_md5: String = map.get("md5");
+    let client_beatmap_md5 =
+        normalized_client_checksum(input.client_beatmap_md5.as_deref(), &original_md5)?;
     if let Err(error) = availability::require_active_set(&state.db, native_set_id).await {
         // An exact score may have committed after the initial retry lookup.
         if let Some(key) = &input.ingestion_key {
@@ -556,11 +570,23 @@ async fn ingest(
         return Ok(value);
     }
     availability::lock_active_set(&mut tx, native_set_id).await?;
-    let mut value:Value=sqlx::query_scalar("INSERT INTO scores(user_id,beatmap_id,mode,score,accuracy,max_combo,mods,pp,passed,hit_counts,client,ingestion_key,api_mods,pp_eligible,standardised_score,standardised_without_mods,classic_score,native_submission,native_basic_maximum,score_scale_status,score_scale_version,score_scale_reason,legacy_attributes,score_variant,pp_calculation_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,'rosu_pp4.v1') ON CONFLICT(ingestion_key) DO UPDATE SET ingestion_key=scores.ingestion_key WHERE scores.user_id=excluded.user_id AND scores.beatmap_id=excluded.beatmap_id AND scores.mode=excluded.mode AND scores.score_variant=excluded.score_variant RETURNING to_jsonb(scores)-'replay_path'")
-        .bind(user_id).bind(input.beatmap_id).bind(input.mode).bind(input.score).bind(accuracy).bind(input.max_combo as i32).bind(i64::from(input.mods)).bind(calculated.pp).bind(input.passed).bind(json!(input.hit_counts)).bind(client).bind(&input.ingestion_key).bind(&input.api_mods).bind(pp_eligible).bind(scales.standardised_score).bind(scales.standardised_without_mods).bind(scales.classic_score).bind(scales.native_submission).bind(scales.native_basic_maximum).bind(scales.status).bind(scales.version).bind(scales.reason).bind(scales.legacy_attributes).bind(variant.as_str()).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError(axum::http::StatusCode::CONFLICT,"ingestion_conflict","The ingestion key belongs to another score.".into()))?;
+    let checksum_registered: bool = sqlx::query_scalar(
+        "SELECT illya_beatmap_checksum_matches(id,$2) FROM beatmaps WHERE id=$1 FOR SHARE",
+    )
+    .bind(input.beatmap_id)
+    .bind(&client_beatmap_md5)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !checksum_registered {
+        return Err(ApiError::bad(
+            "The client checksum does not belong to this beatmap.",
+        ));
+    }
+    let mut value:Value=sqlx::query_scalar("INSERT INTO scores(user_id,beatmap_id,mode,score,accuracy,max_combo,mods,pp,passed,hit_counts,client,ingestion_key,api_mods,pp_eligible,standardised_score,standardised_without_mods,classic_score,native_submission,native_basic_maximum,score_scale_status,score_scale_version,score_scale_reason,legacy_attributes,score_variant,pp_calculation_version,client_beatmap_md5) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,'rosu_pp4.v1',$25) ON CONFLICT(ingestion_key) DO UPDATE SET ingestion_key=scores.ingestion_key WHERE scores.user_id=excluded.user_id AND scores.beatmap_id=excluded.beatmap_id AND scores.mode=excluded.mode AND scores.score_variant=excluded.score_variant RETURNING to_jsonb(scores)-'replay_path'")
+        .bind(user_id).bind(input.beatmap_id).bind(input.mode).bind(input.score).bind(accuracy).bind(input.max_combo as i32).bind(i64::from(input.mods)).bind(calculated.pp).bind(input.passed).bind(json!(input.hit_counts)).bind(client).bind(&input.ingestion_key).bind(&input.api_mods).bind(pp_eligible).bind(scales.standardised_score).bind(scales.standardised_without_mods).bind(scales.classic_score).bind(scales.native_submission).bind(scales.native_basic_maximum).bind(scales.status).bind(scales.version).bind(scales.reason).bind(scales.legacy_attributes).bind(variant.as_str()).bind(&client_beatmap_md5).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError(axum::http::StatusCode::CONFLICT,"ingestion_conflict","The ingestion key belongs to another score.".into()))?;
     // ON CONFLICT may observe a winner published after the locked retry lookup.
     // Compare its immutable input before committing even the no-op update.
-    ensure_retained_input(&value, user_id, &input, client, variant)?;
+    ensure_retained_input(&value, user_id, &input, client, variant, &original_md5)?;
     if let Some(actor) = &actor {
         auth::ensure_mutation_actor(&mut tx, actor).await?;
     }
@@ -581,13 +607,27 @@ async fn retained_submission(
     client: &str,
     variant: ScoreVariant,
 ) -> ApiResult<Option<Value>> {
-    let value: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(s)-'replay_path'||jsonb_build_object('accuracy_source',CASE WHEN s.client='lazer' THEN 'client_reported' ELSE 'judgements' END) FROM scores s WHERE ingestion_key=$1 FOR SHARE OF s")
+    let retained: Option<(Value, String)> = sqlx::query_as("SELECT to_jsonb(s)-'replay_path'||jsonb_build_object('accuracy_source',CASE WHEN s.client='lazer' THEN 'client_reported' ELSE 'judgements' END),b.md5 FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE ingestion_key=$1 FOR SHARE OF s")
         .bind(key).fetch_optional(&mut **tx).await?;
-    if let Some(value) = &value {
-        ensure_retained_input(value, user_id, input, client, variant)?;
+    if let Some((value, original_md5)) = &retained {
+        ensure_retained_input(value, user_id, input, client, variant, original_md5)?;
     }
-    Ok(value)
+    Ok(retained.map(|(value, _)| value))
 }
+
+/// Missing historical input means the retained original, never the preferred
+/// distributed alias. Native retries must continue to name their exact variant.
+fn normalized_client_checksum(supplied: Option<&str>, original: &str) -> ApiResult<String> {
+    let checksum = supplied.unwrap_or(original);
+    if checksum.len() != 32 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::bad("Invalid client beatmap checksum."));
+    }
+    Ok(checksum.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+#[path = "score_checksum_tests.rs"]
+mod checksum_tests;
 
 fn ingestion_conflict() -> ApiError {
     ApiError(
@@ -658,7 +698,17 @@ fn ensure_retained_input(
     input: &Submission,
     client: &str,
     variant: ScoreVariant,
+    original_md5: &str,
 ) -> ApiResult<()> {
+    if !saved["client_beatmap_md5"].is_null() && !saved["client_beatmap_md5"].is_string() {
+        return Err(ingestion_conflict());
+    }
+    let expected_checksum =
+        normalized_client_checksum(input.client_beatmap_md5.as_deref(), original_md5)
+            .map_err(|_| ingestion_conflict())?;
+    let saved_checksum =
+        normalized_client_checksum(saved["client_beatmap_md5"].as_str(), original_md5)
+            .map_err(|_| ingestion_conflict())?;
     let counts = serde_json::from_value::<HitCounts>(saved["hit_counts"].clone())
         .map_err(|_| ingestion_conflict())?;
     let expected_accuracy = if client == "lazer" {
@@ -680,6 +730,7 @@ fn ensure_retained_input(
         || saved["max_combo"].as_u64() != Some(u64::from(input.max_combo))
         || saved["mods"].as_u64() != Some(u64::from(input.mods))
         || saved["passed"].as_bool() != Some(input.passed)
+        || saved_checksum != expected_checksum
         || json!(counts) != json!(input.hit_counts)
         || !same_accuracy
         || !same_structured_mods(input.mode, &saved["api_mods"], input.api_mods.as_ref())
@@ -792,6 +843,7 @@ pub(crate) fn from_stored_row(row: &sqlx::postgres::PgRow) -> ApiResult<Submissi
         hit_counts,
         client: Some(client),
         ingestion_key: row.try_get("ingestion_key")?,
+        client_beatmap_md5: row.try_get("client_beatmap_md5")?,
     })
 }
 
@@ -945,6 +997,7 @@ pub async fn submit(
         || input.client.as_ref().is_some_and(|v| v != "api")
         || input.ingestion_key.is_some()
         || input.native_submission.is_some()
+        || input.client_beatmap_md5.is_some()
     {
         return Err(ApiError::bad(
             "API submissions belong to the signed-in user, use the api client, and cannot supply an ingestion key.",
@@ -1127,7 +1180,7 @@ impl ReplayUploadBinding {
         Self {
             user_id: score.get("user_id"),
             username: score.get("username"),
-            md5: score.get("md5"),
+            md5: score.get("replay_beatmap_md5"),
             mode: score.get("mode"),
             total: score.get("score"),
             combo: score.get("max_combo"),
@@ -1196,7 +1249,7 @@ pub async fn upload_replay(
 ) -> ApiResult {
     let user = auth::require(&state, &headers).await?;
     let _permit = state.upload_permit()?;
-    let score=sqlx::query("SELECT s.*,b.md5,u.username,COALESCE(s.native_submission,(SELECT submission FROM lazer_score_tokens WHERE score_id=s.id AND user_id=s.user_id ORDER BY id LIMIT 1)) replay_submission FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id JOIN users u ON u.id=s.user_id WHERE s.id=$1").bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::missing)?;
+    let score=sqlx::query("SELECT s.*,COALESCE(s.client_beatmap_md5,b.md5) replay_beatmap_md5,u.username,COALESCE(s.native_submission,(SELECT submission FROM lazer_score_tokens WHERE score_id=s.id AND user_id=s.user_id ORDER BY id LIMIT 1)) replay_submission FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id JOIN users u ON u.id=s.user_id WHERE s.id=$1").bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::missing)?;
     if score.get::<i64, _>("user_id") != user.id {
         return Err(ApiError::forbidden());
     }
@@ -1286,7 +1339,7 @@ pub async fn upload_replay(
     drop(file);
     let mut tx = state.db.begin().await?;
     let actor = auth::mutation_actor(&mut tx, &user, &[], auth::MutationScope::Session).await?;
-    let score=sqlx::query("SELECT s.*,b.md5,u.username,COALESCE(s.native_submission,(SELECT submission FROM lazer_score_tokens WHERE score_id=s.id AND user_id=s.user_id ORDER BY id LIMIT 1)) replay_submission FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 FOR UPDATE OF s").bind(id).bind(actor.id).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::missing)?;
+    let score=sqlx::query("SELECT s.*,COALESCE(s.client_beatmap_md5,b.md5) replay_beatmap_md5,u.username,COALESCE(s.native_submission,(SELECT submission FROM lazer_score_tokens WHERE score_id=s.id AND user_id=s.user_id ORDER BY id LIMIT 1)) replay_submission FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 FOR UPDATE OF s").bind(id).bind(actor.id).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::missing)?;
     if ReplayUploadBinding::from_row(&score) != binding {
         return Err(ApiError(axum::http::StatusCode::CONFLICT,"replay_binding_changed","The stored score changed while preparing its replay. Please retry.".into()));
     }
@@ -1333,7 +1386,7 @@ pub async fn replay(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    let row=sqlx::query("SELECT user_id,verification,replay_path,u.is_restricted FROM scores s JOIN users u ON u.id=s.user_id WHERE s.id=$1").bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::missing)?;
+    let row=sqlx::query("SELECT s.user_id,s.verification,s.replay_path,s.mode,b.native_id,u.is_restricted FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1").bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::missing)?;
     if row.get::<String, _>("verification") != "verified" || row.get::<bool, _>("is_restricted") {
         let user = auth::require(&state, &headers).await?;
         if user.id != row.get::<i64, _>("user_id") {
@@ -1355,12 +1408,15 @@ pub async fn replay(
         return Err(ApiError::internal("invalid stored replay size"));
     }
     let bytes = tokio::fs::read(path).await?;
+    let filename =
+        illya_domain::download_filename::replay_filename(row.get("mode"), row.get("native_id"), id)
+            .ok_or_else(|| ApiError::internal("invalid stored replay identity"))?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (
                 header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"illyaverse-score-{id}.osr\""),
+                illya_domain::download_filename::attachment(&filename),
             ),
         ],
         bytes,
@@ -1612,6 +1668,7 @@ mod tests {
                 },
                 client: None,
                 ingestion_key: None,
+                client_beatmap_md5: None,
             };
             assert!(calculate_pp(bytes, &score, false).unwrap().is_finite());
             score.max_combo = 1000;
@@ -1648,6 +1705,7 @@ mod tests {
             },
             client: None,
             ingestion_key: None,
+            client_beatmap_md5: None,
         };
         let custom = calculate_pp(map.as_bytes(), &score, true).unwrap();
         score.api_mods = None;

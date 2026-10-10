@@ -321,12 +321,13 @@ pub async fn internal(
 }
 fn response(set_id: i64, bytes: Bytes) -> ApiResult<Response> {
     let hash = format!("{:x}", Sha256::digest(&bytes));
+    let filename = archive_filename(set_id, &bytes)?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/x-osu-archive".to_owned()),
             (
                 header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"illyaverse-official-{set_id}.osz\""),
+                illya_domain::download_filename::attachment(&filename),
             ),
             (header::CACHE_CONTROL, "private, no-store".to_owned()),
             (
@@ -341,6 +342,55 @@ fn response(set_id: i64, bytes: Bytes) -> ApiResult<Response> {
         Body::from(bytes),
     )
         .into_response())
+}
+fn archive_filename(set_id: i64, bytes: &[u8]) -> ApiResult<String> {
+    use std::io::Read;
+    // These bytes have already passed official identity/member verification.
+    // Read one bounded chart solely for its display name; preserve every ZIP
+    // byte and never ask the provider or metadata API again for a filename.
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| invalid())?;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|_| invalid())?;
+        if !entry.name().to_ascii_lowercase().ends_with(".osu") {
+            continue;
+        }
+        if entry.size() > 8 * 1024 * 1024 {
+            return Err(invalid());
+        }
+        let mut text = String::new();
+        entry
+            .take(8 * 1024 * 1024 + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| invalid())?;
+        if text.len() > 8 * 1024 * 1024 {
+            return Err(invalid());
+        }
+        let mut metadata = false;
+        let mut artist = None;
+        let mut title = None;
+        for line in text.trim_start_matches('\u{feff}').lines().map(str::trim) {
+            if line.starts_with('[') && line.ends_with(']') {
+                metadata = line == "[Metadata]";
+            } else if metadata && let Some((key, value)) = line.split_once(':') {
+                match key.trim() {
+                    "Artist" => artist = Some(value.trim()),
+                    "Title" => title = Some(value.trim()),
+                    _ => {}
+                }
+            }
+        }
+        return illya_domain::download_filename::archive_filename(
+            set_id,
+            artist
+                .filter(|value| !value.is_empty())
+                .ok_or_else(invalid)?,
+            title
+                .filter(|value| !value.is_empty())
+                .ok_or_else(invalid)?,
+        )
+        .ok_or_else(invalid);
+    }
+    Err(invalid())
 }
 async fn authority(state: &AppState, set_id: i64, user_id: Option<i64>) -> ApiResult<()> {
     if let Some(id) = user_id {

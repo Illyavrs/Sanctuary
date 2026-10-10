@@ -415,6 +415,11 @@ pub async fn update_preferences(
     let object = patch
         .as_object()
         .ok_or_else(|| ApiError::bad("Preferences must be an object."))?;
+    if object.get("background_mode").is_some_and(Value::is_null) {
+        return Err(ApiError::bad(
+            "Choose default, image or color background mode.",
+        ));
+    }
     let mut tx = state.db.begin().await?;
     let user = mutation_actor(&mut tx, &user, &[], MutationScope::Session).await?;
     let original: Value =
@@ -611,7 +616,7 @@ pub async fn upload_media(
                     .await?;
             }
             _ => {
-                sqlx::query("UPDATE users SET preferences=jsonb_set(preferences,'{background_url}',to_jsonb($2::text)) WHERE id=$1").bind(user.id).bind(&url).execute(&mut *tx).await?;
+                sqlx::query("UPDATE users SET preferences=jsonb_set(jsonb_set(preferences,'{background_url}',to_jsonb($2::text)),'{background_mode}','\"image\"'::jsonb) WHERE id=$1").bind(user.id).bind(&url).execute(&mut *tx).await?;
             }
         }
         ensure_mutation_actor(&mut tx, &user).await?;
@@ -804,3 +809,7 @@ pub async fn bootstrap(state: &AppState) -> ApiResult<()> {
 #[cfg(test)]
 #[path = "auth_mutation_tests.rs"]
 mod mutation_tests;
+
+#[cfg(test)]
+#[path = "auth_background_preferences_tests.rs"]
+mod background_preferences_tests;

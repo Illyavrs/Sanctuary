@@ -291,9 +291,13 @@ fn assert_archive(response: (StatusCode, HeaderMap, Vec<u8>), set: &ArchiveSet) 
     );
     assert_eq!(
         response.1[header::CONTENT_DISPOSITION],
-        format!(
-            "attachment; filename=\"illyaverse-official-{}.osz\"",
-            set.id
+        illya_domain::download_filename::attachment(
+            &illya_domain::download_filename::archive_filename(
+                set.id,
+                "Illyaverse",
+                &format!("Transient archive {}", set.id),
+            )
+            .unwrap()
         )
     );
     assert_eq!(response.1[header::CACHE_CONTROL], "private, no-store");

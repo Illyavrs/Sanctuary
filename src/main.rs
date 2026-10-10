@@ -17,6 +17,9 @@ mod chat_visibility_tests;
 #[cfg(test)]
 mod integration_tests;
 mod legacy_scoring;
+mod local_distribution;
+#[cfg(test)]
+mod local_distribution_tests;
 mod mail_delivery;
 #[cfg(test)]
 mod mail_queue_tests;
@@ -28,6 +31,9 @@ mod map_package_migration_tests;
 #[cfg(test)]
 mod map_search_tests;
 mod maps;
+#[cfg(test)]
+mod mapset_route_tests;
+mod mapset_routes;
 #[cfg(test)]
 mod native_map_tests;
 #[cfg(test)]
@@ -452,6 +458,7 @@ fn router(state: AppState) -> Router {
             )),
         )
         .route("/api/v1/beatmapsets", get(map_catalogue::list))
+        .route("/api/v1/beatmapsets/{id}", get(mapset_routes::detail))
         .route(
             "/api/v1/official/beatmapsets/search",
             get(maps::browse_official).layer(SetResponseHeaderLayer::overriding(
@@ -533,6 +540,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v1/internal/beatmapsets/archive",
             post(maps::official_archive_internal),
+        )
+        .route(
+            "/api/v1/internal/beatmapsets/{id}/archive",
+            post(maps::internal_set_archive),
         )
         .route(
             "/api/v1/internal/beatmapsets/search",

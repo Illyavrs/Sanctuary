@@ -147,7 +147,7 @@ async fn database_snapshot(state: &AppState) -> DatabaseSnapshot {
     }
 }
 
-async fn files_snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+pub(crate) async fn files_snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
@@ -171,6 +171,193 @@ async fn files_snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
         }
     }
     files
+}
+
+fn metadata_identity(bytes: &[u8], field: &str) -> i64 {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let mut metadata = false;
+    let mut values = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            metadata = line == "[Metadata]";
+        } else if metadata
+            && let Some((key, value)) = line.split_once(':')
+            && key.trim() == field
+        {
+            values.push(value.trim().parse::<i64>().unwrap());
+        }
+    }
+    assert_eq!(values.len(), 1, "one Metadata {field} value");
+    values[0]
+}
+
+fn without_metadata_identity(bytes: &[u8]) -> Vec<u8> {
+    let mut metadata = false;
+    std::str::from_utf8(bytes)
+        .unwrap()
+        .split_inclusive('\n')
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                metadata = trimmed == "[Metadata]";
+            }
+            !metadata
+                || !trimmed
+                    .split_once(':')
+                    .is_some_and(|(key, _)| matches!(key.trim(), "BeatmapID" | "BeatmapSetID"))
+        })
+        .collect::<String>()
+        .into_bytes()
+}
+
+pub(crate) async fn assert_canonical_osu(
+    state: &AppState,
+    id: i64,
+    original: &[u8],
+    downloaded: &[u8],
+) -> String {
+    let map: Value = sqlx::query_scalar("SELECT to_jsonb(b) FROM beatmaps b WHERE id=$1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    let original_md5 = format!("{:x}", md5::compute(original));
+    let delivered_md5 = format!("{:x}", md5::compute(downloaded));
+    assert_eq!(map["source"], "local");
+    for field in ["native_id", "native_set_id"] {
+        assert!((2_000_000_000..=2_147_483_647).contains(&map[field].as_i64().unwrap()));
+    }
+    assert_eq!(map["md5"], original_md5, "stored checksum stays original");
+    assert_eq!(map["native_id"], metadata_identity(downloaded, "BeatmapID"));
+    assert_eq!(
+        map["native_set_id"],
+        metadata_identity(downloaded, "BeatmapSetID")
+    );
+    assert_eq!(
+        without_metadata_identity(downloaded),
+        without_metadata_identity(original),
+        "all unrelated chart bytes are preserved"
+    );
+    assert_ne!(delivered_md5, original_md5);
+    let preferred: String = sqlx::query_scalar("SELECT illya_beatmap_preferred_checksum($1)")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        preferred, delivered_md5,
+        "preferred checksum is the delivered chart"
+    );
+    for checksum in [&original_md5, &delivered_md5] {
+        let matched: bool = sqlx::query_scalar("SELECT illya_beatmap_checksum_matches($1,$2)")
+            .bind(id)
+            .bind(checksum)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert!(
+            matched,
+            "source and delivered checksums identify the same difficulty"
+        );
+    }
+    assert_eq!(
+        tokio::fs::read(state.maps_root.join(map["osu_path"].as_str().unwrap()))
+            .await
+            .unwrap(),
+        original,
+        "retained original chart bytes stay exact"
+    );
+    delivered_md5
+}
+
+fn archive_entries(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let mut entries = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let name = std::str::from_utf8(entry.name_raw())
+            .map(str::to_owned)
+            .unwrap_or_else(|_| {
+                encoding_rs::SHIFT_JIS
+                    .decode_without_bom_handling_and_without_replacement(entry.name_raw())
+                    .expect("synthetic legacy fixture uses CP932 names")
+                    .into_owned()
+            });
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+        assert!(entries.insert(name, bytes).is_none());
+    }
+    entries
+}
+
+pub(crate) async fn assert_canonical_archive(state: &AppState, original: &[u8], downloaded: &[u8]) {
+    let source = archive_entries(original);
+    let delivered = archive_entries(downloaded);
+    assert_eq!(
+        source.keys().collect::<Vec<_>>(),
+        delivered.keys().collect::<Vec<_>>()
+    );
+    for (name, bytes) in &source {
+        let downloaded = &delivered[name];
+        if name.to_ascii_lowercase().ends_with(".osu") {
+            let id: Option<i64> = sqlx::query_scalar("SELECT id FROM beatmaps WHERE md5=$1")
+                .bind(format!("{:x}", md5::compute(bytes)))
+                .fetch_optional(&state.db)
+                .await
+                .unwrap();
+            if let Some(id) = id {
+                assert_canonical_osu(state, id, bytes, downloaded).await;
+            } else {
+                assert_eq!(
+                    downloaded, bytes,
+                    "historical orphan chart {name} has no canonical ID and remains byte-exact"
+                );
+            }
+        } else {
+            assert_eq!(
+                downloaded, bytes,
+                "non-chart ZIP asset {name} stays byte-exact"
+            );
+        }
+    }
+}
+
+pub(crate) async fn assert_original_files_and_declared_derivatives(
+    state: &AppState,
+    original: &BTreeMap<String, Vec<u8>>,
+) {
+    let actual = files_snapshot(&state.maps_root).await;
+    for (name, bytes) in original {
+        assert_eq!(
+            actual.get(name),
+            Some(bytes),
+            "original file {name} stays byte-exact"
+        );
+    }
+    let derived: Vec<(String, String, i64)> = sqlx::query_as("SELECT osu_path,sha256,byte_length FROM local_beatmap_distribution_members UNION ALL SELECT archive_path,sha256,byte_length FROM local_beatmap_distributions WHERE archive_path IS NOT NULL")
+        .fetch_all(&state.db).await.unwrap();
+    let mut expected = original
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (path, sha256, byte_length) in derived {
+        assert!(path.starts_with("distribution-"));
+        let bytes = actual
+            .get(&path)
+            .expect("each committed derivative has retained bytes");
+        assert_eq!(bytes.len() as i64, byte_length);
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), sha256);
+        expected.insert(path);
+    }
+    assert_eq!(
+        actual
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected,
+        "no undeclared derivative or staging files are retained"
+    );
 }
 
 async fn package_row(state: &AppState, id: Uuid) -> Value {
@@ -287,6 +474,8 @@ async fn local_osz_package_and_exact_retry_preserve_durable_identity() {
         assert_eq!(row["legacy"], false);
         assert!(row["archive_path"].as_str().is_some());
         let snapshot = database_snapshot(&state).await;
+        let originals = files_snapshot(&state.maps_root).await;
+        assert_eq!(originals.len(), 3, "one original archive and two original difficulties");
         assert_eq!(snapshot.maps.as_array().unwrap().len(), 2);
         assert_eq!(snapshot.packages.as_array().unwrap().len(), 1);
         assert_eq!(snapshot.audits.as_array().unwrap().len(), 1);
@@ -311,10 +500,11 @@ async fn local_osz_package_and_exact_retry_preserve_durable_identity() {
             assert_eq!(detail["package"], created["package"]);
             let (status, downloaded) = get_bytes(&app, item["download_url"].as_str().unwrap()).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(downloaded, payload);
+            assert_canonical_archive(&state, &payload, &downloaded).await;
             let (status, osu) = get_bytes(&app, &format!("/api/v1/beatmaps/{id}/osu")).await;
             assert_eq!(status, StatusCode::OK);
-            assert!(osu == easy || osu == hard);
+            let original = if item["md5"] == format!("{:x}", md5::compute(&easy)) { &easy } else { &hard };
+            assert_canonical_osu(&state, id, original, &osu).await;
         }
         let list = get_json(&app, "/api/v1/beatmaps?page_size=50").await;
         for item in list["items"].as_array().unwrap() {
@@ -322,7 +512,9 @@ async fn local_osz_package_and_exact_retry_preserve_durable_identity() {
         }
         let (status, downloaded) = get_bytes(&app, created["package"]["download_url"].as_str().unwrap()).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(downloaded, payload);
+        assert_canonical_archive(&state, &payload, &downloaded).await;
+        assert_eq!(database_snapshot(&state).await, snapshot, "distribution preserves source rows and audit history");
+        assert_original_files_and_declared_derivatives(&state, &originals).await;
 
         // A retry returns the moderator's current states, without recreating rows.
         let map_ids = ids(&created);
@@ -342,7 +534,7 @@ async fn local_osz_package_and_exact_retry_preserve_durable_identity() {
         }
         assert_eq!(database_snapshot(&state).await, before);
         assert_eq!(files_snapshot(&state.maps_root).await, files);
-        assert_eq!(files.len(), 3, "one archive and two difficulty files are retained");
+        assert_eq!(files.len(), 6, "original and derived archives each retain their two difficulties");
     }).await;
     fixture.finish(result).await;
 }
@@ -363,10 +555,15 @@ async fn local_osu_exact_retry_is_a_single_difficulty_package() {
         let row = package_row(&state, package_id(&created)).await;
         assert!(row["archive_path"].is_null());
         assert_eq!(row["sha256"], format!("{:x}", Sha256::digest(&payload)));
+        let original_rows = database_snapshot(&state).await;
+        let originals = files_snapshot(&state.maps_root).await;
+        assert_eq!(originals.len(), 1);
         let (status, downloaded) =
             get_bytes(&app, created["package"]["download_url"].as_str().unwrap()).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(downloaded, payload);
+        assert_canonical_osu(&state, ids(&created)[0], &payload, &downloaded).await;
+        assert_eq!(database_snapshot(&state).await, original_rows);
+        assert_original_files_and_declared_derivatives(&state, &originals).await;
         let before = database_snapshot(&state).await;
         let files = files_snapshot(&state.maps_root).await;
         let (status, retried) = upload(&app, &cookie, "same.osu", &payload).await;
@@ -376,7 +573,11 @@ async fn local_osu_exact_retry_is_a_single_difficulty_package() {
         assert_eq!(ids(&retried), ids(&created));
         assert_eq!(database_snapshot(&state).await, before);
         assert_eq!(files_snapshot(&state.maps_root).await, files);
-        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files.len(),
+            2,
+            "the original and canonical derivative are retained"
+        );
     })
     .await;
     fixture.finish(result).await;
@@ -455,14 +656,29 @@ async fn package_difficulties_public_pagination_and_download_kinds() {
         sqlx::query("UPDATE beatmaps SET status='pending' WHERE id=$1").bind(expected_ids[0]).execute(&state.db).await.unwrap();
         let current = get_json(&app,&path).await;
         assert_eq!(current["items"][0]["status"],"pending","moderation state comes from current rows");
+        let source_before_download = database_snapshot(&state).await;
+        let original_files = files_snapshot(&state.maps_root).await;
         for (id,kind,original) in [(expected_ids[0],"osz",payload.as_slice()),(standalone_ids[0],"osu",standalone.as_slice())] {
             let detail = get_json(&app,&format!("/api/v1/beatmaps/{id}")).await;
             assert_eq!(detail["download_kind"],kind);
             let response = app.clone().oneshot(Request::builder().uri(format!("/api/v1/beatmaps/{id}/download")).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(response.status(),StatusCode::OK);
-            assert_eq!(response.headers()[axum::http::header::CONTENT_DISPOSITION].to_str().unwrap(),format!("attachment; filename=\"illyaverse-{id}.{kind}\""));
-            assert_eq!(to_bytes(response.into_body(),2*1024*1024).await.unwrap().as_ref(),original);
+            let filename = if kind == "osz" {
+                format!("{} Illyaverse - Paged package.osz", detail["native_set_id"].as_i64().unwrap())
+            } else {
+                format!("illyaverse-{id}.osu")
+            };
+            assert_eq!(response.headers()[axum::http::header::CONTENT_DISPOSITION].to_str().unwrap(),
+                format!("attachment; filename=\"{filename}\"; filename*=UTF-8''{}",filename.replace(' ',"%20")));
+            let downloaded = to_bytes(response.into_body(),2*1024*1024).await.unwrap();
+            if kind == "osz" {
+                assert_canonical_archive(&state, original, &downloaded).await;
+            } else {
+                assert_canonical_osu(&state, id, original, &downloaded).await;
+            }
         }
+        assert_eq!(database_snapshot(&state).await, source_before_download, "delivery keeps all original rows and history");
+        assert_original_files_and_declared_derivatives(&state, &original_files).await;
         // Exact suffix matching mirrors file_response, including an official
         // archive whose retained filename happens to use uppercase letters.
         let official_bytes = with_official_identity(difficulty("Official public metadata","Normal"),65001,65002);

@@ -280,6 +280,7 @@ fn native_filter(raw: &str) -> ApiResult<(Filter, Option<String>)> {
                     | "e"
                     | "cursor_string"
                     | "cursor[illya]"
+                    | "source"
             )
         })
     {
@@ -309,17 +310,22 @@ fn native_filter(raw: &str) -> ApiResult<(Filter, Option<String>)> {
         Some("true") => true,
         _ => return Err(ApiError::bad("Invalid explicit-content filter.")),
     };
+    let uploaded_only = match fields.get("source").map(String::as_str) {
+        None => false,
+        Some("local") => true,
+        _ => return Err(unsupported()),
+    };
     let filter = Filter {
         q: text_query(fields.remove("q").unwrap_or_default())?,
         mode,
         statuses: statuses(fields.get("s").map(String::as_str).unwrap_or("any"), true)?,
-        source: None,
+        source: uploaded_only.then(|| "local".into()),
         sort: fields
             .get("sort")
             .cloned()
             .unwrap_or_else(|| "ranked_desc".into()),
         uploader: None,
-        uploaded_only: false,
+        uploaded_only,
         nsfw,
         size: 50,
     };
@@ -839,6 +845,18 @@ mod unit_tests {
         ] {
             assert!(native_filter(q).is_err(), "{q}");
         }
+    }
+    #[test]
+    fn explicit_local_native_search_is_uploaded_only_and_cursor_bound() {
+        let (broad, _) = native_filter("s=ranked").unwrap();
+        let (uploaded, _) = native_filter("source=local&s=ranked").unwrap();
+        assert_eq!(broad.source, None);
+        assert!(!broad.uploaded_only);
+        assert_eq!(uploaded.source.as_deref(), Some("local"));
+        assert!(uploaded.uploaded_only);
+        let token = format!("illya1.3.50.{}", broad.fingerprint().unwrap());
+        assert!(parse_cursor(Some(&token), &uploaded).is_err());
+        assert!(native_filter("source=official").is_err());
     }
     #[test]
     fn cursor_is_query_bound_and_roundtrips_both_stock_and_website_forms() {
