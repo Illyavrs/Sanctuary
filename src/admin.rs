@@ -262,6 +262,14 @@ pub struct RoleInput {
     name: String,
     description: String,
     permissions: Vec<String>,
+    /// Short label shown in the profile badge, for example `MOD`.
+    #[serde(default)]
+    short_name: String,
+    /// Badge colour as `#rrggbb`; absent uses the neutral badge style.
+    #[serde(default)]
+    colour: Option<String>,
+    #[serde(default)]
+    display_badge: bool,
 }
 fn validate_role(input: &RoleInput) -> ApiResult<()> {
     if !(3..=32).contains(&input.name.len())
@@ -274,6 +282,20 @@ fn validate_role(input: &RoleInput) -> ApiResult<()> {
         return Err(ApiError::bad(
             "Role names must be 3–32 letters, numbers, underscores or hyphens.",
         ));
+    }
+    let short = input.short_name.trim();
+    if short.chars().count() > 8 || short.chars().any(char::is_control) {
+        return Err(ApiError::bad("Badge labels are at most 8 characters."));
+    }
+    if input.display_badge && short.is_empty() {
+        return Err(ApiError::bad("A displayed badge needs a short label."));
+    }
+    if let Some(colour) = &input.colour
+        && !(colour.len() == 7
+            && colour.starts_with('#')
+            && colour[1..].bytes().all(|c| c.is_ascii_hexdigit()))
+    {
+        return Err(ApiError::bad("Badge colour must look like #3b82f6."));
     }
     if input.permissions.len() > PERMISSIONS.len() + 1
         || input
@@ -311,7 +333,7 @@ pub async fn create_role(
     let user = lock_actor(&mut tx, &user, None).await?;
     user.require("roles.manage")?;
     can_delegate(&user.permissions, &input.permissions)?;
-    let value:Value=sqlx::query_scalar("INSERT INTO roles(name,description,permissions) VALUES($1,$2,$3) RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',0,'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator'))").bind(&input.name).bind(&input.description).bind(&input.permissions).fetch_one(&mut *tx).await?;
+    let value:Value=sqlx::query_scalar("INSERT INTO roles(name,description,permissions,short_name,colour,display_badge) VALUES($1,$2,$3,$4,$5,$6) RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',0,'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator'))").bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'roles.create','role',$2,$3)").bind(user.id).bind(value["id"].to_string()).bind(json!({"name":input.name,"permissions":input.permissions})).execute(&mut *tx).await?;
     auth::ensure_mutation_actor(&mut tx, &user).await?;
     tx.commit().await?;
@@ -355,7 +377,7 @@ pub async fn update_role(
             "The administrator role must retain its name and full permission.".into(),
         ));
     }
-    let value:Value=sqlx::query_scalar("UPDATE roles SET name=$2,description=$3,permissions=$4 WHERE id=$1 RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',(SELECT count(*) FROM user_roles ur WHERE ur.role_id=roles.id),'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator'))").bind(id).bind(&input.name).bind(&input.description).bind(&input.permissions).fetch_one(&mut *tx).await?;
+    let value:Value=sqlx::query_scalar("UPDATE roles SET name=$2,description=$3,permissions=$4,short_name=$5,colour=$6,display_badge=$7 WHERE id=$1 RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',(SELECT count(*) FROM user_roles ur WHERE ur.role_id=roles.id),'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator'))").bind(id).bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).fetch_one(&mut *tx).await?;
     retain_administrator(&mut tx).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'roles.update','role',$2,$3)").bind(user.id).bind(id.to_string()).bind(json!({"name":input.name,"permissions":input.permissions})).execute(&mut *tx).await?;
     auth::ensure_mutation_actor(&mut tx, &user).await?;

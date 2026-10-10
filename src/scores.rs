@@ -863,6 +863,34 @@ impl rosu_pp::any::HitResultGenerator<rosu_pp::mania::Mania> for NativeManiaResu
     }
 }
 
+/// Relax osu!standard and osu!catch use the Sunrise-derived adjustment in
+/// `illya_domain::relax_pp`; other rulesets keep the library value.
+fn relax_adjusted_pp(attributes: &rosu_pp::any::PerformanceAttributes, score: &Submission) -> f64 {
+    use illya_domain::relax_pp;
+    match attributes {
+        rosu_pp::any::PerformanceAttributes::Osu(osu) => {
+            let h = &score.hit_counts;
+            relax_pp::osu_relax_pp(&relax_pp::OsuRelaxInput {
+                pp: osu.pp,
+                aim_pp: osu.pp_aim,
+                speed_pp: osu.pp_speed,
+                accuracy_pp: osu.pp_acc,
+                flashlight_pp: osu.pp_flashlight,
+                aim_difficulty: osu.difficulty.aim,
+                aim_difficult_strain_count: osu.difficulty.aim_difficult_strain_count,
+                speed_difficult_strain_count: osu.difficulty.speed_difficult_strain_count,
+                misses: h.misses,
+                accuracy: relax_pp::osu_accuracy(h.n300, h.n100, h.n50, h.misses),
+                legacy_mods: score.mods,
+            })
+        }
+        rosu_pp::any::PerformanceAttributes::Catch(catch) => {
+            relax_pp::catch_relax_pp(catch.pp, score.mods)
+        }
+        other => other.pp(),
+    }
+}
+
 pub(crate) fn calculate_score(
     bytes: &[u8],
     score: &Submission,
@@ -972,7 +1000,14 @@ pub(crate) fn calculate_score(
                 .map_err(|_| ApiError::bad("Native mania performance attributes are invalid."))?
                 .pp
         }
-        other => other.calculate().pp(),
+        other => {
+            let attributes = other.calculate();
+            if variant == ScoreVariant::Relax {
+                relax_adjusted_pp(&attributes, score)
+            } else {
+                attributes.pp()
+            }
+        }
     };
     if !pp.is_finite() {
         return Err(ApiError::bad("Performance calculation was not finite."));
