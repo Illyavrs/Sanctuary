@@ -257,8 +257,9 @@ async fn profile_media_removal_persistence_and_queued_authorization() {
     sqlx::migrate!("../../migrations").run(&db).await.unwrap();
     let pool = db.clone();
     let application = schema.clone();
+    let media_root = std::env::temp_dir().join(&schema);
+    let media_cleanup_root = media_root.clone();
     let outcome = tokio::spawn(async move {
-        let media_root = std::env::temp_dir().join(&application);
         let state = fixture_state(pool.clone(), media_root.clone());
         let app = router(state.clone());
         let owner = player(&pool, "MediaOwner").await;
@@ -372,5 +373,19 @@ async fn profile_media_removal_persistence_and_queued_authorization() {
         .await
         .unwrap();
     control.close().await;
+    if media_cleanup_root.exists() {
+        let resolved = tokio::fs::canonicalize(&media_cleanup_root).await.unwrap();
+        let temp_root = tokio::fs::canonicalize(std::env::temp_dir()).await.unwrap();
+        assert_eq!(resolved.parent(), Some(temp_root.as_path()));
+        assert_eq!(resolved.file_name(), Some(std::ffi::OsStr::new(&schema)));
+        assert!(
+            !tokio::fs::symlink_metadata(&media_cleanup_root)
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        tokio::fs::remove_dir_all(&resolved).await.unwrap();
+    }
     outcome.unwrap();
 }

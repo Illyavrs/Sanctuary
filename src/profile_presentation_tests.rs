@@ -274,7 +274,9 @@ async fn fixture_checks(db: PgPool, application: String) {
         assert_public(&get(&app, &public_path, cookie).await, "#123456", 50, 50);
     }
     let private = get(&app, "/api/v1/me", Some(&owner_cookie)).await;
-    assert_eq!(private["preferences"], preferences);
+    let mut expected_preferences = preferences.clone();
+    expected_preferences["background_color"] = json!("#000000");
+    assert_eq!(private["preferences"], expected_preferences);
     assert_eq!(private["locale"], "ja");
     assert_eq!(private["email"], "PresentationOwner@example.test");
     assert_eq!(private["email_verified"], true);
