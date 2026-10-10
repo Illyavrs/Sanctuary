@@ -292,7 +292,7 @@ async fn fixture_checks(db: PgPool, application: String) {
     assert_eq!(saved["accent_color"], "#13579B");
     assert_eq!(saved["banner_position_x"], 0);
     assert_eq!(saved["banner_position_y"], 100);
-    assert_eq!(saved["preferences"], preferences);
+    assert_eq!(saved["preferences"], expected_preferences);
     assert_eq!(saved["avatar_url"], upgraded["avatar_url"]);
     assert_eq!(saved["banner_url"], upgraded["banner_url"]);
     assert_eq!(presentation(&db, peer).await, peer_initial);
