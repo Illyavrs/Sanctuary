@@ -339,6 +339,75 @@ fn official_search_query_bounds_and_opaque_encoding() {
         .is_ok()
     );
 }
+
+#[test]
+fn official_search_federated_cursor_roundtrips_and_rejects_invalid_query_positions() {
+    let mut key = parse(Some("q=Fixture&status=ranked&mode=0".into())).unwrap();
+    let value = FederatedCursor {
+        fingerprint: search_fingerprint(&key).unwrap(),
+        epoch: 3,
+        local_position: 50,
+        upstream: false,
+        upstream_cursor: None,
+        upstream_native: None,
+    };
+    let token = encode_federated_cursor(&value).unwrap();
+    key.cursor = Some(token.clone());
+    let decoded = federated_cursor(&key).unwrap().unwrap();
+    assert_eq!(decoded.local_position, 50);
+    assert_eq!(decoded.epoch, 3);
+    assert!(!decoded.upstream);
+    let native = native_parse(&query(&[
+        ("q", "Fixture"),
+        ("s", "ranked"),
+        ("m", "0"),
+        ("cursor[illya]", &token),
+    ]))
+    .unwrap();
+    assert_eq!(native, key);
+    assert!(
+        native_parse(&query(&[
+            ("cursor[illya]", &token),
+            ("cursor_string", &token)
+        ]))
+        .is_err()
+    );
+    let mut changed = key.clone();
+    changed.mode = "3".into();
+    assert_eq!(
+        federated_cursor(&changed).unwrap_err().0,
+        StatusCode::CONFLICT
+    );
+    for raw in ["illyaf2-not-hex", "illyaf2:00", "illyaf2.x", "illyaf2.00"] {
+        let result = parse(Some(query(&[("cursor_string", raw)])))
+            .and_then(|key| federated_cursor(&key).map(|_| key));
+        assert!(result.is_err(), "{raw}");
+    }
+    for position in [-1, 0, 1, 49, 51, i64::MAX] {
+        let cursor = FederatedCursor {
+            fingerprint: search_fingerprint(&key).unwrap(),
+            epoch: 3,
+            local_position: position,
+            upstream: false,
+            upstream_cursor: None,
+            upstream_native: None,
+        };
+        key.cursor = Some(encode_federated_cursor(&cursor).unwrap());
+        assert!(federated_cursor(&key).is_err(), "{position}");
+    }
+    let maximum_upstream = "x".repeat(2048);
+    let cursor = FederatedCursor {
+        fingerprint: search_fingerprint(&key).unwrap(),
+        epoch: 3,
+        local_position: 51,
+        upstream: true,
+        upstream_cursor: Some(maximum_upstream),
+        upstream_native: None,
+    };
+    key.cursor = Some(encode_federated_cursor(&cursor).unwrap());
+    assert!(key.cursor.as_ref().unwrap().len() <= MAX_FEDERATED_CURSOR);
+    assert!(federated_cursor(&key).is_ok());
+}
 #[test]
 fn official_search_sanitizes_and_excludes_deleted_converted_members() {
     let mut value = response();

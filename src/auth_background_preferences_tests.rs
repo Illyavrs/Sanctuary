@@ -265,7 +265,7 @@ async fn background_preferences_preserve_legacy_images_partial_updates_and_actor
         });
         tokio::time::timeout(StdDuration::from_secs(5), async {
             loop {
-                let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND application_name=$1 AND wait_event_type='Lock' AND query LIKE '%ORDER BY id FOR UPDATE%'")
+                let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND application_name=$1 AND wait_event_type='Lock' AND query LIKE '%ORDER BY id FOR NO KEY UPDATE%'")
                     .bind(&application).fetch_one(&pool).await.unwrap();
                 if waiting > 0 { break; }
                 tokio::task::yield_now().await;

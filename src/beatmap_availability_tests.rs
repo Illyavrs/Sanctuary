@@ -421,7 +421,7 @@ async fn withdrawal_queued_editors_use_one_revision_and_recheck_permissions() {
             tokio::spawn(
                 async move { change(&a, &cookie, 46, true, 0, "Queued permission").await },
             );
-        wait_for_lock(&state.db, &application, "ORDER BY id FOR UPDATE").await;
+        wait_for_lock(&state.db, &application, "ORDER BY id FOR NO KEY UPDATE").await;
         // The request's permission table SHARE fence blocks external role edits;
         // a session revocation by this preexisting authority holder remains safe.
         sqlx::query("DELETE FROM sessions WHERE user_id=$1")

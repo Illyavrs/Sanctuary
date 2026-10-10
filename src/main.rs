@@ -36,6 +36,9 @@ mod mapset_route_tests;
 mod mapset_routes;
 #[cfg(test)]
 mod native_map_tests;
+mod notifications;
+#[cfg(test)]
+mod notifications_tests;
 #[cfg(test)]
 mod official_archive_download_tests;
 #[cfg(test)]
@@ -408,6 +411,11 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/me", get(auth::me))
+        .route("/api/v1/me/notifications", get(notifications::list))
+        .route(
+            "/api/v1/me/notifications/read",
+            post(notifications::mark_read).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
         .route("/api/v1/me/sessions", get(account_sessions::list))
         .route(
             "/api/v1/me/sessions/{client}/{id}",

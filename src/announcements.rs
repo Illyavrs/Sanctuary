@@ -245,6 +245,9 @@ pub async fn update(
     .bind(next_revision)
     .execute(&mut *tx)
     .await?;
+    if input.status == "published" && status != "published" {
+        crate::notifications::announcement_published(&mut tx, id, next_revision).await?;
+    }
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'announcements.update','announcement',$2,$3)")
         .bind(actor.id)
         .bind(id.to_string())

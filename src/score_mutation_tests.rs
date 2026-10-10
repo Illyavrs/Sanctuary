@@ -327,7 +327,7 @@ async fn score_and_replay_writes_recheck_queued_authority() {
                 sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE").bind(user).fetch_one(&mut *blocker).await.unwrap();
                 let queued_app = app.clone();
                 let pending = tokio::spawn(async move { request(&queued_app, &path, Some(&cookie), service, content_type, raw).await });
-                let fragment = if service { "SELECT NOT is_restricted FROM users WHERE id=$1 FOR SHARE" } else { "SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR UPDATE" };
+                let fragment = if service { "SELECT NOT is_restricted FROM users WHERE id=$1 FOR SHARE" } else { "SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR NO KEY UPDATE" };
                 wait_for_lock(&state.db, &application, fragment).await;
                 match *change {
                     "revoke" => { sqlx::query("DELETE FROM sessions WHERE id=$1").bind(sid).execute(&mut *blocker).await.unwrap(); }

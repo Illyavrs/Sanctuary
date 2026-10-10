@@ -6,12 +6,15 @@ use axum::{
     extract::{RawQuery, Request},
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 const MAX_ENTRIES: usize = 16;
 const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const POSITIVE_TTL: Duration = Duration::from_secs(60);
 const OPERATION_DEADLINE: Duration = Duration::from_secs(6);
 const MAX_NATIVE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const FEDERATED_CURSOR_PREFIX: &str = "illyaf2.";
+const MAX_FEDERATED_CURSOR: usize = 6144;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SearchKey {
@@ -23,6 +26,7 @@ pub(super) struct SearchKey {
     extras: Vec<(String, String)>,
     structured_cursor: Vec<(String, String)>,
     set_id: Option<i64>,
+    status_modified_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +41,8 @@ struct Input {
     #[serde(default = "ranked_desc")]
     sort: String,
     cursor_string: Option<String>,
+    #[serde(default)]
+    status_modified_only: bool,
 }
 fn all() -> String {
     "all".into()
@@ -49,7 +55,15 @@ fn ranked_desc() -> String {
 }
 
 fn cursor_valid(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 2048 && value.bytes().all(|c| (0x20..=0x7e).contains(&c))
+    if value.starts_with("illyaf") && !value.starts_with(FEDERATED_CURSOR_PREFIX) {
+        return false;
+    }
+    let limit = if value.starts_with(FEDERATED_CURSOR_PREFIX) {
+        MAX_FEDERATED_CURSOR
+    } else {
+        2048
+    };
+    !value.is_empty() && value.len() <= limit && value.bytes().all(|c| (0x20..=0x7e).contains(&c))
 }
 
 fn query_encoding_valid(raw: &str) -> bool {
@@ -114,6 +128,7 @@ fn parse(raw: Option<String>) -> ApiResult<SearchKey> {
         extras: Vec::new(),
         structured_cursor: Vec::new(),
         set_id: None,
+        status_modified_only: input.status_modified_only,
     })
 }
 
@@ -144,8 +159,12 @@ fn native_parse(raw: &str) -> ApiResult<SearchKey> {
             .strip_prefix("cursor[")
             .and_then(|name| name.strip_suffix(']'))
         {
-            if !cursor_field(name)
-                || !cursor_query_part(name, &value)
+            if !(cursor_field(name) || name == "illya")
+                || !(if name == "illya" {
+                    value.starts_with(FEDERATED_CURSOR_PREFIX) && cursor_valid(&value)
+                } else {
+                    cursor_query_part(name, &value)
+                })
                 || structured_cursor.len() >= 16
             {
                 return Err(ApiError::bad("Invalid native search cursor."));
@@ -164,6 +183,7 @@ fn native_parse(raw: &str) -> ApiResult<SearchKey> {
                 | "played"
                 | "nsfw"
                 | "cursor_string"
+                | "status_modified_only"
         ) {
             return Err(ApiError::bad("Unsupported native search query field."));
         }
@@ -277,7 +297,16 @@ fn native_parse(raw: &str) -> ApiResult<SearchKey> {
             extras.push((name.into(), tokens.join(".")));
         }
     }
-    let cursor = fields.get("cursor_string").cloned();
+    let mut cursor = fields.get("cursor_string").cloned();
+    if let Some(index) = structured_cursor
+        .iter()
+        .position(|(name, _)| name == "illya")
+    {
+        if cursor.is_some() || structured_cursor.len() != 1 {
+            return Err(ApiError::bad("Supply one federated search cursor."));
+        }
+        cursor = Some(structured_cursor.remove(index).1);
+    }
     if cursor
         .as_deref()
         .is_some_and(|cursor| !cursor_valid(cursor))
@@ -311,6 +340,11 @@ fn native_parse(raw: &str) -> ApiResult<SearchKey> {
         extras,
         structured_cursor,
         set_id: None,
+        status_modified_only: match fields.get("status_modified_only").map(String::as_str) {
+            None | Some("false") => false,
+            Some("true") => true,
+            _ => return Err(ApiError::bad("Invalid modified-status filter.")),
+        },
     })
 }
 
@@ -439,6 +473,8 @@ impl SearchKey {
 struct Difficulty {
     official_id: i64,
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    official_status: Option<String>,
     version: String,
     mode: i16,
     stars: f64,
@@ -487,6 +523,10 @@ struct SearchResult {
     cursor_string: Option<String>,
     #[serde(skip)]
     native_cursor: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ordering: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_is_exact: Option<bool>,
 }
 
 fn native_result(result: &SearchResult) -> Value {
@@ -502,7 +542,14 @@ fn native_result(result: &SearchResult) -> Value {
             value
         })
         .collect::<Vec<_>>();
-    json!({"beatmapsets":beatmapsets,"total":result.total,"cursor":result.native_cursor,"cursor_string":result.cursor_string})
+    let mut value = json!({"beatmapsets":beatmapsets,"total":result.total,"cursor":result.native_cursor,"cursor_string":result.cursor_string});
+    if let Some(ordering) = result.ordering {
+        value["ordering"] = json!(ordering);
+    }
+    if let Some(exact) = result.total_is_exact {
+        value["total_is_exact"] = json!(exact);
+    }
+    value
 }
 
 fn optional_text(value: Option<&Value>, fallback: &str, maximum: usize) -> ApiResult<String> {
@@ -897,6 +944,27 @@ fn transform(value: &Value) -> ApiResult<SearchResult> {
                         .ok_or_else(invalid)?
                         .to_owned(),
                 },
+                official_status: match map.get("official_status") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_str()
+                            .filter(|status| {
+                                matches!(
+                                    *status,
+                                    "ranked"
+                                        | "approved"
+                                        | "qualified"
+                                        | "loved"
+                                        | "pending"
+                                        | "wip"
+                                        | "graveyard"
+                                )
+                            })
+                            .ok_or_else(invalid)?
+                            .into(),
+                    ),
+                },
                 version: text(&map["version"])?,
                 mode,
                 stars,
@@ -988,6 +1056,8 @@ fn transform(value: &Value) -> ApiResult<SearchResult> {
         total,
         cursor_string,
         native_cursor,
+        ordering: None,
+        total_is_exact: None,
     };
     if serde_json::to_vec(&native_result(&result))
         .map_err(ApiError::internal)?
@@ -1290,6 +1360,291 @@ async fn merge_local(state: &AppState, result: &mut SearchResult) -> ApiResult<(
     }
     Ok(())
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FederatedCursor {
+    fingerprint: String,
+    epoch: i64,
+    local_position: i64,
+    upstream: bool,
+    upstream_cursor: Option<String>,
+    upstream_native: Option<Value>,
+}
+
+fn search_fingerprint(key: &SearchKey) -> ApiResult<String> {
+    let value = json!({"q":key.q,"mode":key.mode,"status":key.status,
+        "sort":key.sort,"extras":key.extras,"status_modified_only":key.status_modified_only});
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).map_err(ApiError::internal)?)
+    ))
+}
+
+fn federated_cursor(key: &SearchKey) -> ApiResult<Option<FederatedCursor>> {
+    let Some(encoded) = key
+        .cursor
+        .as_deref()
+        .and_then(|value| value.strip_prefix(FEDERATED_CURSOR_PREFIX))
+    else {
+        return Ok(None);
+    };
+    if encoded.is_empty()
+        || !encoded.len().is_multiple_of(2)
+        || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApiError::bad("Invalid federated search cursor."));
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).unwrap();
+            let low = (pair[1] as char).to_digit(16).unwrap();
+            (high * 16 + low) as u8
+        })
+        .collect::<Vec<_>>();
+    let value: FederatedCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiError::bad("Invalid federated search cursor."))?;
+    if value.fingerprint != search_fingerprint(key)? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "server_catalogue_changed",
+            "The search filters changed. Start again without a cursor.".into(),
+        ));
+    }
+    if value.epoch < 0
+        || !(0..=i64::from(i32::MAX)).contains(&value.local_position)
+        || (!value.upstream
+            && (value.local_position == 0
+                || value.local_position % 50 != 0
+                || value.upstream_cursor.is_some()
+                || value.upstream_native.is_some()))
+        || (key.status_modified_only && value.upstream)
+        || value.upstream_cursor.as_deref().is_some_and(|cursor| {
+            !cursor_valid(cursor) || cursor.starts_with(FEDERATED_CURSOR_PREFIX)
+        })
+        || (value.upstream_cursor.is_some() && value.upstream_native.is_some())
+    {
+        return Err(ApiError::bad("Invalid federated search cursor position."));
+    }
+    if let Some(native) = &value.upstream_native {
+        let native = native_cursor(Some(native))?.ok_or_else(invalid)?;
+        let required = required_cursor_fields(&key.sort, &key.status);
+        if required.iter().any(|field| native.get(*field).is_none()) {
+            return Err(ApiError::bad("Incomplete federated upstream cursor."));
+        }
+    }
+    Ok(Some(value))
+}
+
+fn encode_federated_cursor(value: &FederatedCursor) -> ApiResult<String> {
+    let bytes = serde_json::to_vec(value).map_err(ApiError::internal)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(FEDERATED_CURSOR_PREFIX.len() + bytes.len() * 2);
+    encoded.push_str(FEDERATED_CURSOR_PREFIX);
+    for byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 15)] as char);
+    }
+    if encoded.len() > MAX_FEDERATED_CURSOR {
+        return Err(invalid());
+    }
+    Ok(encoded)
+}
+
+fn set_federated_continuation(
+    result: &mut SearchResult,
+    continuation: Option<FederatedCursor>,
+) -> ApiResult<()> {
+    result.cursor_string = continuation
+        .as_ref()
+        .map(encode_federated_cursor)
+        .transpose()?;
+    result.native_cursor = result
+        .cursor_string
+        .as_ref()
+        .map(|cursor| json!({"illya":cursor}));
+    Ok(())
+}
+
+fn effective_matches(item: &Item, key: &SearchKey) -> bool {
+    item.difficulties.iter().any(|map| {
+        (key.mode == "all" || key.mode.parse::<i16>() == Ok(map.mode))
+            && match key.status.as_str() {
+                "any" => true,
+                "leaderboard" => matches!(
+                    map.status.as_str(),
+                    "ranked" | "approved" | "qualified" | "loved"
+                ),
+                "ranked" => matches!(map.status.as_str(), "ranked" | "approved"),
+                "pending" => matches!(map.status.as_str(), "pending" | "unranked" | "wip"),
+                status => map.status == status,
+            }
+    })
+}
+
+fn bounded_discovery(result: SearchResult) -> ApiResult<SearchResult> {
+    if serde_json::to_vec(&native_result(&result))
+        .map_err(ApiError::internal)?
+        .len()
+        > MAX_NATIVE_RESPONSE_BYTES
+    {
+        return Err(invalid());
+    }
+    Ok(result)
+}
+
+/// A finite modified prefix, followed by one upstream page per request. No
+/// response-size fill loop or search import is involved. The aggregate count
+/// is explicitly an estimate because upstream may include overridden sets.
+async fn discovery_result(
+    state: &AppState,
+    key: &SearchKey,
+    headers: Option<&HeaderMap>,
+    user_id: Option<i64>,
+) -> ApiResult<SearchResult> {
+    let cursor = federated_cursor(key)?;
+    if key.status_modified_only
+        && cursor.is_none()
+        && (key.cursor.is_some() || !key.structured_cursor.is_empty())
+    {
+        return Err(ApiError::bad(
+            "Use a modified-search continuation for this filter.",
+        ));
+    }
+    let offset = cursor
+        .as_ref()
+        .filter(|cursor| !cursor.upstream)
+        .map_or(0, |cursor| cursor.local_position);
+    let (sets, local_total, epoch) = crate::server_catalogue::modified_official_page(
+        state,
+        crate::server_catalogue::OfficialFilter {
+            q: &key.q,
+            mode: &key.mode,
+            status: &key.status,
+            sort: &key.sort,
+            extras: &key.extras,
+            public: headers.is_none() && user_id.is_none(),
+            include_items: cursor.as_ref().is_none_or(|cursor| !cursor.upstream),
+        },
+        offset,
+        cursor.as_ref().map(|cursor| cursor.epoch),
+    )
+    .await?;
+    let has_modified = !crate::server_catalogue::modified_official_ids(state, None)
+        .await?
+        .is_empty();
+    let federated = has_modified || cursor.is_some() || key.status_modified_only;
+    let legacy_upstream_cursor =
+        cursor.is_none() && (key.cursor.is_some() || !key.structured_cursor.is_empty());
+    if !legacy_upstream_cursor
+        && cursor.as_ref().is_none_or(|cursor| !cursor.upstream)
+        && (local_total > offset || key.status_modified_only)
+    {
+        let mut result = transform(&json!({"beatmapsets":sets,"total":local_total}))?;
+        merge_local(state, &mut result).await?;
+        result.ordering = Some("server_modified_first");
+        result.total_is_exact = Some(key.status_modified_only);
+        let position = offset + result.items.len() as i64;
+        let continuation = if position < local_total || !key.status_modified_only {
+            Some(FederatedCursor {
+                fingerprint: search_fingerprint(key)?,
+                epoch,
+                local_position: position,
+                upstream: position >= local_total,
+                upstream_cursor: None,
+                upstream_native: None,
+            })
+        } else {
+            None
+        };
+        set_federated_continuation(&mut result, continuation)?;
+        crate::server_catalogue::verify_epoch(state, epoch).await?;
+        return bounded_discovery(result);
+    }
+    let mut upstream_key = key.clone();
+    upstream_key.status_modified_only = false;
+    if let Some(cursor) = &cursor {
+        upstream_key.cursor.clone_from(&cursor.upstream_cursor);
+        upstream_key.structured_cursor = cursor
+            .upstream_native
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    let mut result = resolve(state, headers, &upstream_key, user_id).await?;
+    if let Some(headers) = headers {
+        authorize(state, headers).await?;
+    }
+    if let Some(user) = user_id {
+        require_active_user(state, user).await?;
+    }
+    merge_local(state, &mut result).await?;
+    let ids = result
+        .items
+        .iter()
+        .map(|item| item.official_set_id)
+        .collect::<Vec<_>>();
+    let modified = crate::server_catalogue::modified_official_ids(state, Some(&ids)).await?;
+    result.items.retain(|item| {
+        (headers.is_some() || !item.local.withdrawn)
+            && effective_matches(item, key)
+            && (!federated || !modified.contains(&item.official_set_id))
+    });
+    if federated {
+        let next_native = if result.cursor_string.is_none() {
+            result.native_cursor.as_ref().map(|value| {
+                let required = required_cursor_fields(&key.sort, &key.status);
+                let fields = value
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(field, _)| required.contains(&field.as_str()))
+                    .map(|(field, value)| (field.clone(), value.clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                Value::Object(fields)
+            })
+        } else {
+            None
+        };
+        let continuation = if result.cursor_string.is_some() || next_native.is_some() {
+            Some(FederatedCursor {
+                fingerprint: search_fingerprint(key)?,
+                epoch,
+                local_position: local_total,
+                upstream: true,
+                upstream_cursor: result.cursor_string.clone(),
+                upstream_native: next_native,
+            })
+        } else {
+            None
+        };
+        result.total = result
+            .total
+            .saturating_add(local_total)
+            .min(i64::from(i32::MAX));
+        result.ordering = Some("server_modified_first");
+        result.total_is_exact = Some(false);
+        set_federated_continuation(&mut result, continuation)?;
+    }
+    crate::server_catalogue::verify_epoch(state, epoch).await?;
+    bounded_discovery(result)
+}
 pub async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1298,9 +1653,7 @@ pub async fn search(
     authorize(&state, &headers).await?;
     let key = parse(raw)?;
     let result = tokio::time::timeout(OPERATION_DEADLINE, async {
-        let mut result = resolve(&state, Some(&headers), &key, None).await?;
-        authorize(&state, &headers).await?;
-        merge_local(&state, &mut result).await?;
+        let result = discovery_result(&state, &key, Some(&headers), None).await?;
         authorize(&state, &headers).await?;
         Ok::<_, ApiError>(result)
     })
@@ -1355,6 +1708,26 @@ pub(crate) async fn catalogue_snapshot(state: &AppState, set_id: i64) -> ApiResu
 
 async fn public_result(state: &AppState, key: SearchKey) -> ApiResult<SearchResult> {
     let deadline = tokio::time::Instant::now() + OPERATION_DEADLINE;
+    if key.set_id.is_none() {
+        return match tokio::time::timeout_at(deadline, discovery_result(state, &key, None, None))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let error = timeout_error();
+                if let Ok(mut official) = state.official.try_lock()
+                    && cached(&mut official, &key).is_none_or(|result| result.is_err())
+                {
+                    remember(
+                        &mut official,
+                        key,
+                        &Err(ApiError(error.0, error.1, error.2.clone())),
+                    );
+                }
+                Err(error)
+            }
+        };
+    }
     if let Some(set_id) = key.set_id {
         tokio::time::timeout_at(
             deadline,
@@ -1431,11 +1804,10 @@ pub async fn native_search(
     require_active_user(&state, input.user_id).await?;
     let key = native_parse(&input.query)?;
     let operation = tokio::time::timeout(OPERATION_DEADLINE, async {
-        let result = resolve(&state, None, &key, Some(input.user_id)).await;
+        let result = discovery_result(&state, &key, None, Some(input.user_id)).await;
         // Restriction wins over cached failures and network/flight errors.
         require_active_user(&state, input.user_id).await?;
-        let mut result = result?;
-        merge_local(&state, &mut result).await?;
+        let result = result?;
         require_active_user(&state, input.user_id).await?;
         Ok::<_, ApiError>(native_result(&result))
     })
@@ -1513,3 +1885,7 @@ pub(crate) async fn staff_detail(
 #[cfg(test)]
 #[path = "official_search_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "federated_search_tests.rs"]
+mod federated_tests;

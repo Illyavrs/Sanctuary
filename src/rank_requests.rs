@@ -1038,6 +1038,7 @@ pub(crate) async fn review(
         .map(|ids| ids.iter().copied().collect::<Vec<_>>());
     sqlx::query("UPDATE beatmap_rank_requests SET status=$2,review_reason=$3,reviewed_by=$4,reviewed_at=clock_timestamp(),approved_difficulty_ids=$5 WHERE id=$1")
         .bind(id).bind(&input.decision).bind(reason).bind(actor.id).bind(&approved).execute(&mut *tx).await?;
+    crate::notifications::rank_request_decided(&mut tx, id).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'beatmaps.rank_request.review','beatmap_rank_request',$2,$3)")
         .bind(actor.id).bind(id.to_string()).bind(json!({"native_set_id":set_id,"decision":input.decision,"difficulty_ids":approved,"reason":reason,"previous_revision":input.expected_revision})).execute(&mut *tx).await?;
     let value = projection(&mut *tx, id).await?;

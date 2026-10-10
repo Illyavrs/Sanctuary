@@ -472,7 +472,7 @@ async fn auth_mutation_guards_and_queued_writes() {
                 Ok::<_, ApiError>(())
             }));
         }
-        wait_for_lock(&pool, &application, "ORDER BY id FOR UPDATE", 2).await;
+        wait_for_lock(&pool, &application, "ORDER BY id FOR NO KEY UPDATE", 2).await;
         sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE NOWAIT").bind(high).fetch_one(&mut *blocking).await.unwrap();
         blocking.commit().await.unwrap();
         for worker in workers { tokio::time::timeout(StdDuration::from_secs(5), worker).await.unwrap().unwrap().unwrap(); }
@@ -524,7 +524,7 @@ async fn auth_mutation_guards_and_queued_writes() {
         let worker = tokio::spawn(async move {
             account_recovery::enqueue_verification(&queued_state, &snapshot(verification_user, sid, &[])).await
         });
-        wait_for_lock(&pool, &application, "ORDER BY id FOR UPDATE", 1).await;
+        wait_for_lock(&pool, &application, "ORDER BY id FOR NO KEY UPDATE", 1).await;
         tokio::time::timeout(StdDuration::from_secs(5), async {
             revoke_sessions(&mut changing, verification_user, None).await.unwrap();
             ensure_mutation_actor(&mut changing, &lease).await.unwrap();
@@ -560,7 +560,7 @@ async fn auth_mutation_guards_and_queued_writes() {
                 let queued_method = method.clone();
                 let queued_body = body.clone();
                 let queued = tokio::spawn(async move { request(&queued_app, queued_method, path, &token, Some(queued_body)).await });
-                wait_for_lock(&pool, &application, "ORDER BY id FOR UPDATE", 1).await;
+                wait_for_lock(&pool, &application, "ORDER BY id FOR NO KEY UPDATE", 1).await;
                 if invalidation == "session" {
                     sqlx::query("DELETE FROM sessions WHERE id=$1").bind(sid).execute(&mut *blocking).await.unwrap();
                 } else {
@@ -583,7 +583,7 @@ async fn auth_mutation_guards_and_queued_writes() {
         sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE").bind(actor_id).fetch_one(&mut *blocking).await.unwrap();
         let queued_app = app.clone();
         let queued = tokio::spawn(async move { upload_avatar(&queued_app, &token).await });
-        wait_for_lock(&pool, &application, "ORDER BY id FOR UPDATE", 1).await;
+        wait_for_lock(&pool, &application, "ORDER BY id FOR NO KEY UPDATE", 1).await;
         let staging = state.media_root.join(".illya-media-staging");
         assert_eq!(directory_entries(&staging).await, 1);
         assert_eq!(directory_entries(&state.media_root.join("avatar")).await, 0);

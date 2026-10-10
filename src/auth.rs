@@ -88,7 +88,9 @@ pub(crate) async fn mutation_actor(
     users.extend_from_slice(extra_user_ids);
     users.sort_unstable();
     users.dedup();
-    sqlx::query("SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR UPDATE")
+    // Fence every user update while allowing foreign-key KEY SHARE checks on
+    // notification recipients. UPDATE locks would deadlock concurrent fan-out.
+    sqlx::query("SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR NO KEY UPDATE")
         .bind(&users)
         .fetch_all(&mut **tx)
         .await?;

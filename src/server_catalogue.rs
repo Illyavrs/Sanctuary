@@ -69,6 +69,10 @@ struct Filter {
     uploaded_only: bool,
     nsfw: bool,
     size: i64,
+    modified_only: bool,
+    genre: Option<i32>,
+    language: Option<i32>,
+    features: Vec<String>,
 }
 impl Filter {
     fn order(&self) -> ApiResult<&'static str> {
@@ -128,6 +132,7 @@ pub(crate) struct PublicFilter {
     sort: Option<String>,
     uploaded_by: Option<i64>,
     uploaded_only: Option<bool>,
+    status_modified_only: Option<bool>,
     page: Option<u32>,
     page_size: Option<u32>,
 }
@@ -156,6 +161,10 @@ pub(crate) async fn list(
         uploaded_only: input.uploaded_only.unwrap_or(false),
         nsfw: true,
         size,
+        modified_only: input.status_modified_only.unwrap_or(false),
+        genre: None,
+        language: None,
+        features: Vec::new(),
     };
     filter.order()?;
     let _public = PUBLIC_SLOTS.try_acquire().map_err(|_| busy())?;
@@ -281,6 +290,7 @@ fn native_filter(raw: &str) -> ApiResult<(Filter, Option<String>)> {
                     | "cursor_string"
                     | "cursor[illya]"
                     | "source"
+                    | "status_modified_only"
             )
         })
     {
@@ -328,6 +338,14 @@ fn native_filter(raw: &str) -> ApiResult<(Filter, Option<String>)> {
         uploaded_only,
         nsfw,
         size: 50,
+        modified_only: match fields.get("status_modified_only").map(String::as_str) {
+            None | Some("false") => false,
+            Some("true") => true,
+            _ => return Err(ApiError::bad("Invalid modified-status filter.")),
+        },
+        genre: None,
+        language: None,
+        features: Vec::new(),
     };
     filter.order()?;
     let cursor = fields.remove("cursor_string");
@@ -360,7 +378,7 @@ fn parse_cursor(cursor: Option<&str>, filter: &Filter) -> ApiResult<(i64, Option
         .ok_or_else(changed)?;
     Ok((offset, Some(epoch)))
 }
-async fn verify_epoch(state: &AppState, expected: i64) -> ApiResult<()> {
+pub(crate) async fn verify_epoch(state: &AppState, expected: i64) -> ApiResult<()> {
     let current: i64 =
         sqlx::query_scalar("SELECT epoch FROM server_catalogue_revision WHERE singleton")
             .fetch_one(&state.db)
@@ -369,6 +387,109 @@ async fn verify_epoch(state: &AppState, expected: i64) -> ApiResult<()> {
         return Err(changed());
     }
     Ok(())
+}
+
+/// Only published public snapshots participate in official federation. Private
+/// nomination payloads and merely retained official files are never discovery.
+pub(crate) struct OfficialFilter<'a> {
+    pub q: &'a str,
+    pub mode: &'a str,
+    pub status: &'a str,
+    pub sort: &'a str,
+    pub extras: &'a [(String, String)],
+    pub public: bool,
+    pub include_items: bool,
+}
+pub(crate) async fn modified_official_page(
+    state: &AppState,
+    input: OfficialFilter<'_>,
+    offset: i64,
+    expected: Option<i64>,
+) -> ApiResult<(Vec<Value>, i64, i64)> {
+    let OfficialFilter {
+        q,
+        mode,
+        status,
+        sort,
+        extras,
+        public,
+        include_items,
+    } = input;
+    let mut filter = Filter {
+        q: text_query(q.into())?,
+        mode: if mode == "all" {
+            None
+        } else {
+            Some(mode.parse().map_err(ApiError::internal)?)
+        },
+        statuses: statuses(status, true)?,
+        source: Some("official".into()),
+        sort: sort.into(),
+        uploader: None,
+        uploaded_only: false,
+        nsfw: extras
+            .iter()
+            .any(|(key, value)| key == "nsfw" && value == "true"),
+        size: if include_items { 50 } else { 0 },
+        modified_only: true,
+        genre: extras
+            .iter()
+            .find(|(key, _)| key == "g")
+            .and_then(|(_, value)| value.parse().ok()),
+        language: extras
+            .iter()
+            .find(|(key, _)| key == "l")
+            .and_then(|(_, value)| value.parse().ok()),
+        features: extras
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "c" | "e"))
+            .flat_map(|(_, value)| value.split('.').map(str::to_owned))
+            .collect(),
+    };
+    // Some official sorts require statistics which published metadata does not
+    // retain. The separately advertised server prefix uses newest local change.
+    if filter.order().is_err() {
+        filter.sort = "recent".into();
+    }
+    let _public = if public {
+        Some(PUBLIC_SLOTS.try_acquire().map_err(|_| busy())?)
+    } else {
+        None
+    };
+    let _slot = SLOTS.try_acquire().map_err(|_| busy())?;
+    let (items, total, epoch) = result(state, &filter, offset, expected).await?;
+    let sets = items
+        .iter()
+        .map(|item| {
+            let mut set = native_item(item)?;
+            // Federation subsequently merges the currently configured archive
+            // provider. Preserve the published upstream permission for that merge.
+            let disabled = item["metadata"]["download_disabled"] == true;
+            set["download_disabled"] = json!(disabled);
+            set["availability"] = json!({"download_disabled":disabled,"more_information":null});
+            Ok(set)
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    Ok((sets, total, epoch))
+}
+
+/// The finite modified prefix owns these canonical identities, including sets
+/// which no longer satisfy the requested effective mode/status/text filters.
+/// Excluding them from upstream prevents both duplicate pages and false matches.
+pub(crate) async fn modified_official_ids(
+    state: &AppState,
+    candidates: Option<&[i64]>,
+) -> ApiResult<Vec<i64>> {
+    sqlx::query_scalar(r#"SELECT DISTINCT m.native_set_id FROM beatmap_catalogue_metadata m
+        CROSS JOIN LATERAL jsonb_array_elements(m.metadata->'beatmaps') d
+        LEFT JOIN beatmaps b ON b.native_id=(d->>'id')::bigint AND b.native_set_id=m.native_set_id
+        LEFT JOIN beatmap_status_overrides o ON o.native_id=(d->>'id')::bigint AND o.native_set_id=m.native_set_id
+        WHERE illya_beatmapset_active(m.native_set_id)
+            AND ($1::bigint[] IS NULL OR m.native_set_id=ANY($1))
+            AND COALESCE(o.status,b.status,CASE d->>'status' WHEN 'approved' THEN 'ranked' WHEN 'qualified' THEN 'unranked' ELSE d->>'status' END)
+                IS DISTINCT FROM CASE d->>'status' WHEN 'approved' THEN 'ranked' WHEN 'qualified' THEN 'unranked' ELSE d->>'status' END
+        ORDER BY m.native_set_id LIMIT CASE WHEN $1::bigint[] IS NULL THEN 1 ELSE 50 END"#)
+        .bind(candidates).fetch_all(&state.db).await.map_err(Into::into)
 }
 
 async fn result(
@@ -384,6 +505,8 @@ async fn result(
             m.metadata->>'title' title,m.metadata->>'artist' artist,
             m.metadata->>'creator' creator,d->>'version' version,(d->>'mode_int')::smallint mode,
             COALESCE(o.status,b.status,CASE d->>'status' WHEN 'approved' THEN 'ranked' WHEN 'qualified' THEN 'unranked' ELSE d->>'status' END) status,
+            COALESCE(o.status,b.status,CASE d->>'status' WHEN 'approved' THEN 'ranked' WHEN 'qualified' THEN 'unranked' ELSE d->>'status' END)
+                IS DISTINCT FROM CASE d->>'status' WHEN 'approved' THEN 'ranked' WHEN 'qualified' THEN 'unranked' ELSE d->>'status' END status_modified,
             d->>'status' official_status,'official'::text source,(d->>'difficulty_rating')::float8 stars,
             (d->>'total_length')::integer length_seconds,(d->>'bpm')::float8 bpm,(d->>'max_combo')::integer max_combo,
             lower(d->>'checksum') checksum,b.uploaded_by,COALESCE(b.created_at,m.created_at) added_at,
@@ -404,7 +527,8 @@ async fn result(
              OR EXISTS(SELECT 1 FROM beatmaps stored WHERE stored.native_set_id=m.native_set_id))
     ), stored_members AS MATERIALIZED (
         SELECT b.native_set_id,b.native_id,b.id local_id,b.title,b.artist,b.creator,b.version,b.mode,
-            COALESCE(o.status,b.status) status,NULL::text official_status,b.source,b.stars,b.length_seconds,b.bpm,b.max_combo,
+            COALESCE(o.status,b.status) status,(b.source='local' AND COALESCE(o.status,b.status)<>'graveyard') status_modified,
+            NULL::text official_status,b.source,b.stars,b.length_seconds,b.bpm,b.max_combo,
             lower(b.md5) checksum,b.uploaded_by,b.created_at added_at,COALESCE(o.changed_at,b.created_at) status_since,
             b.created_at updated_at,NULL::jsonb metadata,NULL::jsonb native_meta,false nsfw,false version_conflict,
             (b.archive_path IS NOT NULL OR EXISTS(SELECT 1 FROM beatmap_packages p WHERE p.id=b.local_package_id AND p.kind='osz')
@@ -421,6 +545,13 @@ async fn result(
             AND ($4::text IS NULL OR source=$4) AND ($5::bigint IS NULL OR uploaded_by=$5)
             AND (NOT $6::boolean OR (source='local' AND uploaded_by IS NOT NULL AND native_set_id>=2000000000))
             AND ($7::boolean OR NOT nsfw)
+            AND (NOT $11::boolean OR status_modified)
+            AND ($12::integer IS NULL OR (metadata->'genre'->>'id')::integer=$12)
+            AND ($13::integer IS NULL OR (metadata->'language'->>'id')::integer=$13)
+            AND (NOT ('video'=ANY($14::text[])) OR COALESCE((metadata->>'video')::boolean,false))
+            AND (NOT ('storyboard'=ANY($14::text[])) OR COALESCE((metadata->>'storyboard')::boolean,false))
+            AND (NOT ('spotlights'=ANY($14::text[])) OR COALESCE((metadata->>'spotlight')::boolean,false))
+            AND (NOT ('featured_artists'=ANY($14::text[])) OR COALESCE((metadata->>'track_id')::bigint,0)>0)
     ), grouped AS (
         SELECT native_set_id,min(local_id) representative_id,min(title) title,min(artist) artist,min(creator) creator,min(source) source,
             count(*) matching_count,array_agg(DISTINCT mode ORDER BY mode) matching_modes,
@@ -463,6 +594,10 @@ async fn result(
         .bind(filter.size)
         .bind(offset)
         .bind(&filter.q)
+        .bind(filter.modified_only)
+        .bind(filter.genre)
+        .bind(filter.language)
+        .bind(&filter.features)
         .fetch_one(&state.db)
         .await?;
     let epoch: i64 = row.try_get("epoch")?;
@@ -570,6 +705,7 @@ fn native_item(item: &Value) -> ApiResult<Value> {
                 "bpm":m["bpm"],"max_combo":m["max_combo"],"convert":false,"user_id":0,"owners":[],"is_scoreable":true})
         };
         value["checksum"]=m["checksum"].clone();value["status"]=json!(native_status(status));value["ranked"]=json!(rank(native_status(status)));
+        if m["official_status"].is_string() { value["official_status"]=m["official_status"].clone(); }
         value
     }).collect::<Vec<_>>();
     let disabled = set["download_disabled"] == true || !archive;

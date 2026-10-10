@@ -433,7 +433,7 @@ async fn fixture_checks(db: PgPool, application: String) {
         wait_for_lock(
             &db,
             &application,
-            "SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR UPDATE",
+            "SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR NO KEY UPDATE",
         )
         .await;
         match invalidation {

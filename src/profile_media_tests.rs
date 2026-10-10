@@ -332,7 +332,7 @@ async fn profile_media_removal_persistence_and_queued_authorization() {
                 .bind(owner).fetch_one(&mut *blocking).await.unwrap();
             let queued_app = app.clone();
             let queued = tokio::spawn(async move { remove(&queued_app, Some(&cookie), "avatar").await });
-            wait_for_lock(&pool, &application, "SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR UPDATE").await;
+            wait_for_lock(&pool, &application, "SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR NO KEY UPDATE").await;
             match invalidation {
                 "deleted" => { sqlx::query("DELETE FROM sessions WHERE id=$1").bind(sid).execute(&mut *blocking).await.unwrap(); }
                 "expired" => { sqlx::query("UPDATE sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1").bind(sid).execute(&mut *blocking).await.unwrap(); }

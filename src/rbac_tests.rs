@@ -355,7 +355,7 @@ async fn scoped_rbac_privacy_deletion_revocation_and_queued_authorization() {
         sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE").bind(manager).fetch_one(&mut *recovery).await.unwrap();
         let queued_app = app.clone();
         let queued = tokio::spawn(async move { request(&queued_app, Method::DELETE, &format!("/api/v1/admin/roles/{queued_role}"), &cookie, None).await });
-        wait_for_lock(&pool, &application, "ORDER BY id FOR UPDATE").await;
+        wait_for_lock(&pool, &application, "ORDER BY id FOR NO KEY UPDATE").await;
         tokio::time::timeout(Duration::from_secs(5), async {
             sqlx::query("UPDATE users SET password_hash='replacement' WHERE id=$1").bind(manager).execute(&mut *recovery).await.unwrap();
             auth::revoke_sessions(&mut recovery, manager, None).await.unwrap();
