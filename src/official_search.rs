@@ -1559,13 +1559,57 @@ async fn discovery_result(
         } else {
             None
         };
+        let fill_upstream = !key.status_modified_only && position >= local_total;
         set_federated_continuation(&mut result, continuation)?;
+        if fill_upstream {
+            // A short modified-status prefix would otherwise leave clients with
+            // no official rows until they request a second page. Append one
+            // upstream page; if upstream is unavailable keep the local prefix
+            // and its continuation.
+            if let Ok(upstream) = upstream_page(
+                state, key, headers, user_id, None, true, epoch, local_total,
+            )
+            .await
+            {
+                let local_count = result.items.len();
+                result.items.extend(upstream.items);
+                result.items.truncate(local_count + 50);
+                result.total = upstream.total;
+                result.total_is_exact = Some(false);
+                result.cursor_string = upstream.cursor_string;
+                result.native_cursor = upstream.native_cursor;
+            }
+        }
         crate::server_catalogue::verify_epoch(state, epoch).await?;
         return bounded_discovery(result);
     }
+    let result = upstream_page(
+        state,
+        key,
+        headers,
+        user_id,
+        cursor.as_ref(),
+        federated,
+        epoch,
+        local_total,
+    )
+    .await?;
+    crate::server_catalogue::verify_epoch(state, epoch).await?;
+    bounded_discovery(result)
+}
+async fn upstream_page(
+    state: &AppState,
+    key: &SearchKey,
+    headers: Option<&HeaderMap>,
+    user_id: Option<i64>,
+    cursor: Option<&FederatedCursor>,
+    federated: bool,
+    epoch: i64,
+    local_total: i64,
+) -> ApiResult<SearchResult> {
     let mut upstream_key = key.clone();
     upstream_key.status_modified_only = false;
-    if let Some(cursor) = &cursor {
+    if let Some(cursor) = cursor {
         upstream_key.cursor.clone_from(&cursor.upstream_cursor);
         upstream_key.structured_cursor = cursor
             .upstream_native
@@ -1642,8 +1686,7 @@ async fn discovery_result(
         result.total_is_exact = Some(false);
         set_federated_continuation(&mut result, continuation)?;
     }
-    crate::server_catalogue::verify_epoch(state, epoch).await?;
-    bounded_discovery(result)
+    Ok(result)
 }
 pub async fn search(
     State(state): State<AppState>,
