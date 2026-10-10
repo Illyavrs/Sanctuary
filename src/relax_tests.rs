@@ -218,7 +218,7 @@ async fn relax_scores_statistics_and_recalculation_are_partitioned() {
         let (status,_,recalculated)=request(&app,Method::POST,endpoint,Some(&cookies[1]),Some(json!({"score_ids":[historic]}))).await;
         assert_eq!(status,StatusCode::OK,"{recalculated}");assert_eq!(recalculated["items"][0]["pp_eligible"],true);assert_eq!(recalculated["items"][0]["verification"],"verified");
         let row=sqlx::query("SELECT score,mods,user_id,verification,pp_eligible,pp_calculation_version FROM scores WHERE id=$1").bind(historic).fetch_one(&db).await.unwrap();
-        assert_eq!(row.get::<i64,_>("score"),0);assert_eq!(row.get::<i64,_>("mods"),128);assert_eq!(row.get::<i64,_>("user_id"),alice);assert_eq!(row.get::<String,_>("verification"),"verified");assert!(row.get::<bool,_>("pp_eligible"));assert_eq!(row.get::<String,_>("pp_calculation_version"),"rosu_pp4.relax.v1");
+        assert_eq!(row.get::<i64,_>("score"),0);assert_eq!(row.get::<i64,_>("mods"),128);assert_eq!(row.get::<i64,_>("user_id"),alice);assert_eq!(row.get::<String,_>("verification"),"verified");assert!(row.get::<bool,_>("pp_eligible"));assert_eq!(row.get::<String,_>("pp_calculation_version"),"rosu_pp4.relax.sunrise.v1");
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM audit_events WHERE action='scores.relax_recalculate' AND actor_id=$1 AND target_id=$2").bind(bob).bind(historic.to_string()).fetch_one(&db).await.unwrap(),1);
         for ids in [json!([]),json!([historic,historic]),json!((1..=17).collect::<Vec<i64>>())] {
             assert_eq!(request(&app,Method::POST,endpoint,Some(&cookies[1]),Some(json!({"score_ids":ids}))).await.0,StatusCode::BAD_REQUEST);
@@ -297,6 +297,199 @@ async fn relax_migration_preserves_review_and_explicit_exclusions() {
         .await;
     control.close().await;
     cleanup.unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]
+async fn bulk_recalculation_filters_runs_and_guards_authority() {
+    let url = env::var("ILLYA_TEST_DATABASE_URL").expect("disposable PostgreSQL URL");
+    let control = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("illya_recalc_{suffix}");
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&control)
+        .await
+        .unwrap();
+    let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+        .unwrap()
+        .options([("search_path", schema.as_str())]);
+    let db = PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let test_root = std::env::temp_dir().join(format!("illyaverse-recalc-{suffix}"));
+    assert!(test_root.is_absolute() && test_root.parent() == Some(std::env::temp_dir().as_path()));
+    let outcome=AssertUnwindSafe(async {
+        sqlx::migrate!("../../migrations").run(&db).await.unwrap();
+        let state=AppState{
+            db:db.clone(),secret:Arc::new("relax-test-session-secret-at-least-32-bytes".into()),internal_key:Arc::new("relax-test-service-secret-at-least-32-bytes".into()),origin:Arc::new("http://localhost:3000".into()),mail:Arc::new(mail_delivery::MailConfig::disabled()),secure_cookie:false,media_root:test_root.join("media"),maps_root:test_root.join("maps"),replay_root:test_root.join("replays"),client:reqwest::Client::new(),official:Arc::new(Mutex::new(maps::OfficialState::default())),limits:Arc::new(Mutex::new(HashMap::new())),trusted_proxies:Arc::new(Vec::new()),upload_slots:Arc::new(tokio::sync::Semaphore::new(2)),chat_runtime:Default::default(),
+        };
+        tokio::fs::create_dir_all(&state.maps_root).await.unwrap();
+        tokio::fs::write(state.maps_root.join("fixture.osu"),MAP).await.unwrap();
+        let mut users = Vec::new();
+        for name in ["RecalcAlice", "RecalcBob", "RecalcMod", "RecalcPlain"] {
+            let id: i64 = sqlx::query_scalar("INSERT INTO users(username,email,password_hash,password_md5_hash,country) VALUES($1,$2,'fixture','fixture','TW') RETURNING id")
+                .bind(name).bind(format!("{name}@example.invalid")).fetch_one(&db).await.unwrap();
+            sqlx::query("INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE name='player'").bind(id).execute(&db).await.unwrap();
+            users.push(id);
+        }
+        let (alice, bob, moderator, plain) = (users[0], users[1], users[2], users[3]);
+        sqlx::query("INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE name='moderator'").bind(moderator).execute(&db).await.unwrap();
+        let mut maps = Vec::new();
+        for name in ["First", "Second"] {
+            let id: i64 = sqlx::query_scalar("INSERT INTO beatmaps(title,artist,creator,version,mode,status,stars,md5,osu_path) VALUES($1,'Fixture','Illyaverse','Two circles',0,'ranked',1,$2,'fixture.osu') RETURNING id")
+                .bind(name).bind(format!("{:x}", md5::compute(name))).fetch_one(&db).await.unwrap();
+            maps.push(id);
+        }
+        let (first, second) = (maps[0], maps[1]);
+        let native_first: i64 = sqlx::query_scalar("SELECT native_id FROM beatmaps WHERE id=$1").bind(first).fetch_one(&db).await.unwrap();
+        // Every stored pp is wrong (1.0) so a recalculation visibly changes it.
+        let alice_vanilla = score(&db, alice, first, 0, 0, 1.0, 95.0, true, "verified", true, None, "A").await;
+        let alice_relax = score(&db, alice, first, 0, 128, 1.0, 95.0, true, "verified", true, None, "A").await;
+        let bob_relax = score(&db, bob, second, 0, 128, 1.0, 90.0, true, "verified", true, None, "B").await;
+        let bob_pending = score(&db, bob, second, 0, 128, 1.0, 90.0, true, "pending", true, None, "B").await;
+        let bob_failed = score(&db, bob, second, 0, 128, 0.0, 10.0, false, "verified", true, None, "F").await;
+        let alice_rejected = score(&db, alice, second, 0, 128, 1.0, 90.0, true, "rejected", true, None, "B").await;
+        sqlx::query("UPDATE scores SET created_at='2026-01-15T12:00:00Z' WHERE id=$1").bind(alice_vanilla).execute(&db).await.unwrap();
+
+        let app = router(state.clone());
+        let mut cookies = Vec::new();
+        for user in [moderator, plain] {
+            let sid = uuid::Uuid::new_v4();
+            sqlx::query("INSERT INTO sessions(id,user_id,expires_at) VALUES($1,$2,now()+interval '1 day')").bind(sid).bind(user).execute(&db).await.unwrap();
+            let claims = json!({"sub":user,"sid":sid,"exp":(chrono::Utc::now()+chrono::Duration::days(1)).timestamp()});
+            let jwt = jsonwebtoken::encode(&jsonwebtoken::Header::default(), &claims, &jsonwebtoken::EncodingKey::from_secret(state.secret.as_bytes())).unwrap();
+            cookies.push(format!("illya_session={jwt}"));
+        }
+        let (moderator_cookie, plain_cookie) = (&cookies[0], &cookies[1]);
+        let preview = "/api/v1/admin/scores/recalculation/preview";
+        let jobs = "/api/v1/admin/scores/recalculation/jobs";
+        let ask = |filters: Value| json!({ "filters": filters });
+
+        // Only score moderators may look or start.
+        assert_eq!(request(&app, Method::POST, preview, Some(plain_cookie), Some(ask(json!({})))).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(request(&app, Method::POST, preview, None, Some(ask(json!({})))).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(request(&app, Method::GET, jobs, Some(plain_cookie), None).await.0, StatusCode::FORBIDDEN);
+
+        // Filters: failed and rejected scores never match; the rest narrow by each field.
+        let count = |filters: Value| {
+            let app = app.clone();
+            let cookie = moderator_cookie.clone();
+            async move {
+                let (status, _, value) = request(&app, Method::POST, preview, Some(&cookie), Some(json!({"filters": filters}))).await;
+                assert_eq!(status, StatusCode::OK, "{value}");
+                value
+            }
+        };
+        assert_eq!(count(json!({})).await["total"], 4);
+        assert_eq!(count(json!({"variant":"relax"})).await["total"], 3);
+        assert_eq!(count(json!({"variant":"vanilla"})).await["total"], 1);
+        assert_eq!(count(json!({"user":"recalcbob"})).await["total"], 2);
+        assert_eq!(count(json!({"user":bob.to_string()})).await["total"], 2);
+        assert_eq!(count(json!({"verification":"pending"})).await["total"], 1);
+        assert_eq!(count(json!({"verification":"verified","variant":"relax"})).await["total"], 2);
+        assert_eq!(count(json!({"beatmap_id":native_first})).await["total"], 2);
+        assert_eq!(count(json!({"from":"2026-01-01","to":"2026-01-31"})).await["total"], 1);
+        assert_eq!(count(json!({"from":"2026-01-16","to":"2026-01-31"})).await["total"], 0);
+        assert_eq!(count(json!({"mode":1})).await["total"], 0);
+        assert_eq!(count(json!({"score_ids":[alice_relax, bob_failed, alice_rejected]})).await["total"], 1);
+        assert_eq!(count(json!({"min_pp":2.0})).await["total"], 0);
+        let overview = count(json!({"user":"RecalcAlice"})).await;
+        assert_eq!(overview["players"], 1);
+        assert_eq!(overview["sample"].as_array().unwrap().len(), 2);
+        assert_eq!(overview["current_versions"]["relax"], "rosu_pp4.relax.sunrise.v1");
+        for bad in [json!({"user":"nobody-here"}), json!({"beatmap_id":999999999}), json!({"variant":"autopilot"}), json!({"from":"2026-02-01","to":"2026-01-01"})] {
+            let status = request(&app, Method::POST, preview, Some(moderator_cookie), Some(ask(bad))).await.0;
+            assert!(status.is_client_error(), "{status}");
+        }
+        // Nothing to do is refused instead of creating an empty job.
+        assert_eq!(request(&app, Method::POST, jobs, Some(moderator_cookie), Some(ask(json!({"mode":1})))).await.0, StatusCode::BAD_REQUEST);
+
+        // A job for one player's Relax scores recalculates only those.
+        let (status, _, created) = request(&app, Method::POST, jobs, Some(moderator_cookie), Some(ask(json!({"user":"RecalcAlice","variant":"relax"})))).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["status"], "queued");
+        assert_eq!(created["total"], 1);
+        let job = created["id"].as_i64().unwrap();
+        // Only one job may be active.
+        assert_eq!(request(&app, Method::POST, jobs, Some(moderator_cookie), Some(ask(json!({"variant":"vanilla"})))).await.0, StatusCode::CONFLICT);
+        assert!(score_recalculation::run_next(&state).await.unwrap());
+        assert!(!score_recalculation::run_next(&state).await.unwrap());
+        let (_, _, detail) = request(&app, Method::GET, &format!("{jobs}/{job}"), Some(moderator_cookie), None).await;
+        assert_eq!(detail["status"], "completed", "{detail}");
+        assert_eq!((detail["processed"].as_i64(), detail["updated"].as_i64(), detail["failed"].as_i64()), (Some(1), Some(1), Some(0)));
+        assert_eq!(detail["created_by_name"], "RecalcMod");
+        assert_eq!(detail["changes"][0]["score_id"], alice_relax);
+        assert_eq!(detail["changes"][0]["previous_pp"], 1.0);
+        assert!((detail["changes"][0]["new_pp"].as_f64().unwrap() - 1.0).abs() > 1e-6);
+        assert!(detail["pp_delta"].as_f64().unwrap().abs() > 1e-6);
+        let stored = |id: i64| {
+            let db = db.clone();
+            async move { sqlx::query("SELECT pp,pp_calculation_version FROM scores WHERE id=$1").bind(id).fetch_one(&db).await.unwrap() }
+        };
+        let row = stored(alice_relax).await;
+        assert!((row.get::<f64, _>("pp") - 1.0).abs() > 1e-6);
+        assert_eq!(row.get::<Option<String>, _>("pp_calculation_version").as_deref(), Some("rosu_pp4.relax.sunrise.v1"));
+        for untouched in [alice_vanilla, bob_relax, bob_pending, bob_failed, alice_rejected] {
+            assert_eq!(stored(untouched).await.get::<Option<String>, _>("pp_calculation_version"), None);
+        }
+        assert_eq!(stored(bob_relax).await.get::<f64, _>("pp"), 1.0);
+        for action in ["scores.recalculate_start", "scores.recalculate_finish"] {
+            assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events WHERE action=$1 AND actor_id=$2 AND target_id=$3").bind(action).bind(moderator).bind(job.to_string()).fetch_one(&db).await.unwrap(), 1);
+        }
+        // Recalculated scores are no longer "outdated"; the others still are.
+        assert_eq!(count(json!({"variant":"relax","outdated_only":true})).await["total"], 2);
+
+        // A second pass over the same scores changes nothing.
+        let (_, _, again) = request(&app, Method::POST, jobs, Some(moderator_cookie), Some(ask(json!({"user":"RecalcAlice","variant":"relax"})))).await;
+        assert!(score_recalculation::run_next(&state).await.unwrap());
+        let (_, _, again) = request(&app, Method::GET, &format!("{jobs}/{}", again["id"]), Some(moderator_cookie), None).await;
+        assert_eq!((again["updated"].as_i64(), again["unchanged"].as_i64()), (Some(0), Some(1)), "{again}");
+
+        // Cancelling a queued job frees the slot; cancelling a finished one is refused.
+        let (_, _, queued) = request(&app, Method::POST, jobs, Some(moderator_cookie), Some(ask(json!({"variant":"vanilla"})))).await;
+        let queued = queued["id"].as_i64().unwrap();
+        let (status, _, cancelled) = request(&app, Method::POST, &format!("{jobs}/{queued}/cancel"), Some(moderator_cookie), None).await;
+        assert_eq!(status, StatusCode::OK, "{cancelled}");
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(!score_recalculation::run_next(&state).await.unwrap());
+        assert_eq!(request(&app, Method::POST, &format!("{jobs}/{queued}/cancel"), Some(moderator_cookie), None).await.0, StatusCode::CONFLICT);
+        assert_eq!(request(&app, Method::POST, &format!("{jobs}/{}/cancel", queued + 1000), Some(moderator_cookie), None).await.0, StatusCode::NOT_FOUND);
+
+        // Vanilla uses its own version stamp; a pending score is included by default.
+        let (_, _, vanilla) = request(&app, Method::POST, jobs, Some(moderator_cookie), Some(ask(json!({"variant":"vanilla","from":"2026-01-01","to":"2026-01-31"})))).await;
+        assert!(score_recalculation::run_next(&state).await.unwrap());
+        let (_, _, vanilla) = request(&app, Method::GET, &format!("{jobs}/{}", vanilla["id"]), Some(moderator_cookie), None).await;
+        assert_eq!(vanilla["status"], "completed");
+        assert_eq!(stored(alice_vanilla).await.get::<Option<String>, _>("pp_calculation_version").as_deref(), Some("rosu_pp4.v1"));
+
+        // A job stops when its operator loses the permission.
+        let (_, _, revoked) = request(&app, Method::POST, jobs, Some(moderator_cookie), Some(ask(json!({"user":"RecalcBob"})))).await;
+        sqlx::query("DELETE FROM user_roles WHERE user_id=$1 AND role_id=(SELECT id FROM roles WHERE name='moderator')").bind(moderator).execute(&db).await.unwrap();
+        assert!(score_recalculation::run_next(&state).await.unwrap());
+        let row = sqlx::query("SELECT status,error,processed FROM score_recalculation_jobs WHERE id=$1").bind(revoked["id"].as_i64().unwrap()).fetch_one(&db).await.unwrap();
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert!(row.get::<Option<String>, _>("error").unwrap().contains("permission"));
+        assert_eq!(row.get::<i64, _>("processed"), 0);
+        assert_eq!(stored(bob_relax).await.get::<f64, _>("pp"), 1.0);
+        // And can no longer start or read jobs.
+        assert_eq!(request(&app, Method::GET, jobs, Some(moderator_cookie), None).await.0, StatusCode::FORBIDDEN);
+    }).catch_unwind().await;
+    db.close().await;
+    let drop_schema = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&control).await;
+    control.close().await;
+    if test_root.exists() {
+        tokio::fs::remove_dir_all(&test_root).await.unwrap();
+    }
+    drop_schema.unwrap();
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }

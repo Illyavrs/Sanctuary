@@ -59,6 +59,7 @@ mod rank_requests;
 mod rbac_tests;
 #[cfg(test)]
 mod relax_tests;
+mod score_recalculation;
 mod score_recovery;
 mod score_scales;
 mod scores;
@@ -643,6 +644,24 @@ fn router(state: AppState) -> Router {
             "/api/v1/admin/scores/recalculate-relax",
             post(scores::recalculate_relax).layer(DefaultBodyLimit::max(1024)),
         )
+        .route(
+            "/api/v1/admin/scores/recalculation/preview",
+            post(score_recalculation::preview).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/api/v1/admin/scores/recalculation/jobs",
+            get(score_recalculation::list_jobs)
+                .post(score_recalculation::create_job)
+                .layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/api/v1/admin/scores/recalculation/jobs/{id}",
+            get(score_recalculation::job_detail),
+        )
+        .route(
+            "/api/v1/admin/scores/recalculation/jobs/{id}/cancel",
+            post(score_recalculation::cancel_job).layer(DefaultBodyLimit::max(1024)),
+        )
         .route("/api/v1/admin/audit", get(admin::audit_events))
         // Mount only published image kinds. Private staging remains on the
         // same volume for atomic rename and has no static route of its own.
@@ -741,6 +760,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     auth::bootstrap(&state).await?;
     score_recovery::start(state.clone());
     rank_history::start(state.db.clone());
+    score_recalculation::start(state.clone());
     mail_delivery::start(state.db.clone(), state.mail.clone());
     sqlx::query("DELETE FROM sessions WHERE expires_at < now()")
         .execute(&state.db)

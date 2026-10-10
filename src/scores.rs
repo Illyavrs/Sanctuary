@@ -582,7 +582,7 @@ async fn ingest(
             "The client checksum does not belong to this beatmap.",
         ));
     }
-    let mut value:Value=sqlx::query_scalar("INSERT INTO scores(user_id,beatmap_id,mode,score,accuracy,max_combo,mods,pp,passed,hit_counts,client,ingestion_key,api_mods,pp_eligible,standardised_score,standardised_without_mods,classic_score,native_submission,native_basic_maximum,score_scale_status,score_scale_version,score_scale_reason,legacy_attributes,score_variant,pp_calculation_version,client_beatmap_md5) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,'rosu_pp4.v1',$25) ON CONFLICT(ingestion_key) DO UPDATE SET ingestion_key=scores.ingestion_key WHERE scores.user_id=excluded.user_id AND scores.beatmap_id=excluded.beatmap_id AND scores.mode=excluded.mode AND scores.score_variant=excluded.score_variant RETURNING to_jsonb(scores)-'replay_path'")
+    let mut value:Value=sqlx::query_scalar("INSERT INTO scores(user_id,beatmap_id,mode,score,accuracy,max_combo,mods,pp,passed,hit_counts,client,ingestion_key,api_mods,pp_eligible,standardised_score,standardised_without_mods,classic_score,native_submission,native_basic_maximum,score_scale_status,score_scale_version,score_scale_reason,legacy_attributes,score_variant,pp_calculation_version,client_beatmap_md5) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,CASE WHEN $24='relax' THEN 'rosu_pp4.relax.sunrise.v1' ELSE 'rosu_pp4.v1' END,$25) ON CONFLICT(ingestion_key) DO UPDATE SET ingestion_key=scores.ingestion_key WHERE scores.user_id=excluded.user_id AND scores.beatmap_id=excluded.beatmap_id AND scores.mode=excluded.mode AND scores.score_variant=excluded.score_variant RETURNING to_jsonb(scores)-'replay_path'")
         .bind(user_id).bind(input.beatmap_id).bind(input.mode).bind(input.score).bind(accuracy).bind(input.max_combo as i32).bind(i64::from(input.mods)).bind(calculated.pp).bind(input.passed).bind(json!(input.hit_counts)).bind(client).bind(&input.ingestion_key).bind(&input.api_mods).bind(pp_eligible).bind(scales.standardised_score).bind(scales.standardised_without_mods).bind(scales.classic_score).bind(scales.native_submission).bind(scales.native_basic_maximum).bind(scales.status).bind(scales.version).bind(scales.reason).bind(scales.legacy_attributes).bind(variant.as_str()).bind(&client_beatmap_md5).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError(axum::http::StatusCode::CONFLICT,"ingestion_conflict","The ingestion key belongs to another score.".into()))?;
     // ON CONFLICT may observe a winner published after the locked retry lookup.
     // Compare its immutable input before committing even the no-op update.
@@ -773,7 +773,7 @@ async fn score_publication_actor(
     }
 }
 
-fn mod_partition(score: &Submission, client: &str) -> ApiResult<(ScoreVariant, bool)> {
+pub(crate) fn mod_partition(score: &Submission, client: &str) -> ApiResult<(ScoreVariant, bool)> {
     if !(0..=3).contains(&score.mode) {
         return Err(ApiError::bad("Unsupported ruleset."));
     }
@@ -888,6 +888,17 @@ fn relax_adjusted_pp(attributes: &rosu_pp::any::PerformanceAttributes, score: &S
             relax_pp::catch_relax_pp(catch.pp, score.mods)
         }
         other => other.pp(),
+    }
+}
+
+/// Stored with every score so operators can find the ones calculated by an older method.
+pub(crate) const PP_VERSION_VANILLA: &str = "rosu_pp4.v1";
+pub(crate) const PP_VERSION_RELAX: &str = "rosu_pp4.relax.sunrise.v1";
+
+pub(crate) fn pp_version(variant: ScoreVariant) -> &'static str {
+    match variant {
+        ScoreVariant::Relax => PP_VERSION_RELAX,
+        ScoreVariant::Vanilla => PP_VERSION_VANILLA,
     }
 }
 
@@ -1075,7 +1086,7 @@ pub async fn internal_submit(
 pub struct RelaxRecalculation {
     score_ids: Vec<i64>,
 }
-fn relax_calculation_binding(row: &sqlx::postgres::PgRow) -> Value {
+pub(crate) fn relax_calculation_binding(row: &sqlx::postgres::PgRow) -> Value {
     json!({
         "user_id":row.get::<i64,_>("user_id"),"beatmap_id":row.get::<i64,_>("beatmap_id"),
         "mode":row.get::<i16,_>("mode"),"score":row.get::<i64,_>("score"),
@@ -1184,12 +1195,12 @@ pub async fn recalculate_relax(
         }
         let previous = row.get::<f64, _>("pp");
         let previous_eligible = row.get::<bool, _>("pp_eligible");
-        sqlx::query("UPDATE scores SET pp=$2,pp_eligible=true,pp_calculation_version='rosu_pp4.relax.v1' WHERE id=$1")
-            .bind(id).bind(pp).execute(&mut *tx).await?;
+        sqlx::query("UPDATE scores SET pp=$2,pp_eligible=true,pp_calculation_version=$3 WHERE id=$1")
+            .bind(id).bind(pp).bind(PP_VERSION_RELAX).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'scores.relax_recalculate','score',$2,$3)")
-            .bind(operator.id).bind(id.to_string()).bind(json!({"previous_pp":previous,"pp":pp,"previous_pp_eligible":previous_eligible,"pp_eligible":true,"mode":row.get::<i16,_>("mode"),"score_variant":"relax","calculation_version":"rosu_pp4.relax.v1","verification_unchanged":true}))
+            .bind(operator.id).bind(id.to_string()).bind(json!({"previous_pp":previous,"pp":pp,"previous_pp_eligible":previous_eligible,"pp_eligible":true,"mode":row.get::<i16,_>("mode"),"score_variant":"relax","calculation_version":PP_VERSION_RELAX,"verification_unchanged":true}))
             .execute(&mut *tx).await?;
-        results.push(json!({"id":id,"pp":pp,"pp_eligible":true,"score_variant":"relax","pp_calculation_version":"rosu_pp4.relax.v1","verification":row.get::<String,_>("verification")}));
+        results.push(json!({"id":id,"pp":pp,"pp_eligible":true,"score_variant":"relax","pp_calculation_version":PP_VERSION_RELAX,"verification":row.get::<String,_>("verification")}));
     }
     auth::ensure_mutation_actor(&mut tx, &operator).await?;
     tx.commit().await?;
