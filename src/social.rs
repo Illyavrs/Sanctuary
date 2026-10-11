@@ -27,9 +27,39 @@ pub struct Change {
     relation_type: Kind,
 }
 
+/// Player-card JSON shared by the friends list and the online list: identity, banner and
+/// the highest-ranked badge group, plus whether a game client is connected right now.
+const CARD: &str = "jsonb_build_object('id',u.id,'username',u.username,'avatar_url',u.avatar_url,'country',u.country,'banner_url',u.banner_url,'banner_position_x',u.banner_position_x,'banner_position_y',u.banner_position_y,'accent_color',u.accent_color,'online',EXISTS(SELECT 1 FROM bancho_sessions b WHERE b.user_id=u.id AND b.expires_at>now()) OR EXISTS(SELECT 1 FROM lazer_sessions l WHERE l.user_id=u.id AND l.access_expires_at>now() AND l.last_seen_at>now()-interval '3 minutes'),'groups',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name,'short_name',r.short_name,'colour',r.colour) ORDER BY r.rank DESC,r.id) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id AND r.display_badge),'[]'::jsonb))";
+
+#[derive(Deserialize)]
+pub struct OnlineQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+/// Everyone with a live game session, newest activity irrelevant: alphabetical for a stable list.
+pub async fn online(State(state): State<AppState>, Query(query): Query<OnlineQuery>) -> ApiResult {
+    let size = query.page_size.unwrap_or(24).clamp(1, 60);
+    let offset = (query.page.unwrap_or(1).max(1) - 1) * size;
+    let active = "SELECT user_id FROM bancho_sessions WHERE expires_at>now() UNION SELECT user_id FROM lazer_sessions WHERE access_expires_at>now() AND last_seen_at>now()-interval '3 minutes'";
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM users u WHERE NOT u.is_restricted AND u.id IN ({active})"
+    ))
+    .fetch_one(&state.db)
+    .await?;
+    let items = sqlx::query_scalar::<_, Value>(&format!(
+        "SELECT {CARD} FROM users u WHERE NOT u.is_restricted AND u.id IN ({active}) ORDER BY lower(u.username),u.id LIMIT $1 OFFSET $2"
+    ))
+    .bind(size)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(json!({"items":items,"total":total})))
+}
+
 pub async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     let user = auth::require(&state, &headers).await?;
-    let records = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('target_id',u.id,'relation_type',r.relation_type,'mutual',EXISTS(SELECT 1 FROM user_relationships inverse WHERE inverse.user_id=u.id AND inverse.target_id=$1 AND inverse.relation_type='friend'),'target',jsonb_build_object('id',u.id,'username',u.username,'avatar_url',u.avatar_url,'country',u.country)) FROM user_relationships r JOIN users u ON u.id=r.target_id WHERE r.user_id=$1 AND NOT u.is_restricted ORDER BY lower(u.username),u.id")
+    let records = sqlx::query_scalar::<_, Value>(&format!("SELECT jsonb_build_object('target_id',u.id,'relation_type',r.relation_type,'mutual',EXISTS(SELECT 1 FROM user_relationships inverse WHERE inverse.user_id=u.id AND inverse.target_id=$1 AND inverse.relation_type='friend'),'target',{CARD}) FROM user_relationships r JOIN users u ON u.id=r.target_id WHERE r.user_id=$1 AND NOT u.is_restricted ORDER BY lower(u.username),u.id"))
         .bind(user.id).fetch_all(&state.db).await?;
     let (friends, blocks): (Vec<_>, Vec<_>) = records
         .into_iter()

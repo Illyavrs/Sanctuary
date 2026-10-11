@@ -428,6 +428,7 @@ fn router(state: AppState) -> Router {
             post(account_sessions::revoke_others),
         )
         .route("/api/v1/me/relationships", get(social::list))
+        .route("/api/v1/users/online", get(social::online))
         .route(
             "/api/v1/me/relationships/{id}",
             post(social::change)
