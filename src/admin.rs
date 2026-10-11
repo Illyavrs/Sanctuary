@@ -733,6 +733,17 @@ pub async fn send_broadcast(
         .rows_affected() as i64;
     }
     if input.game {
+        // Also keep a copy in #announce for chat history and lazer, which has no popup.
+        let line = format!("[{title}] {}", message.replace('\n', " "));
+        let content: String = line.chars().take(1000).collect();
+        sqlx::query(
+            "INSERT INTO chat_messages(channel_id,user_id,content)
+             SELECT id,$1,$2 FROM channels WHERE name='announce'",
+        )
+        .bind(actor.id)
+        .bind(content)
+        .execute(&mut *tx)
+        .await?;
         // In-game delivery is a stable notification popup, queued for every connected session
         // exactly like the welcome notice shown at login. It is picked up on the next poll.
         let packet = resonance_protocol::stable::string_packet(

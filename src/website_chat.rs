@@ -380,12 +380,20 @@ pub(crate) async fn store_message(
             return Err(ApiError::missing());
         }
     } else {
-        let permission: Option<String> =
-            sqlx::query_scalar("SELECT required_permission FROM channels WHERE id=$1 FOR SHARE")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(ApiError::missing)?;
+        let (permission, read_only): (Option<String>, bool) = sqlx::query_as(
+            "SELECT required_permission,read_only FROM channels WHERE id=$1 FOR SHARE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::missing)?;
+        if read_only {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "channel_read_only",
+                "Only staff broadcasts can be posted to this channel.".into(),
+            ));
+        }
         if let Some(permission) = permission {
             if matches!(
                 permission.as_str(),
