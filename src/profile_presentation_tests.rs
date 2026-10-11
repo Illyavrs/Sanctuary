@@ -378,6 +378,7 @@ async fn fixture_checks(db: PgPool, application: String) {
     assert_eq!(code, StatusCode::OK, "{theme}");
     assert_eq!(theme["accent_color"], "#2468ac");
     expected["preferences"]["accent_color"] = json!("#2468ac");
+    expected["preferences"]["bancho_rank"] = json!(false);
     expected["preferences"]["background_color"] = json!("#000000");
     assert_eq!(presentation(&db, owner).await, expected);
     assert_public(
