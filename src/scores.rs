@@ -1102,9 +1102,7 @@ pub(crate) fn calculate_score(
             rosu_pp::Performance::Mania(p) if lazer => {
                 p.hitresult_generator::<NativeManiaResults>()
                     .calculate()
-                    .map_err(|_| {
-                        ApiError::bad("Native mania performance attributes are invalid.")
-                    })?
+                    .map_err(|_| ApiError::bad("Native mania performance attributes are invalid."))?
                     .pp
             }
             other => relax_adjusted_pp(&other.calculate(), score),
