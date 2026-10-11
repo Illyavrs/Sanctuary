@@ -64,7 +64,12 @@ pub async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResul
     let (friends, blocks): (Vec<_>, Vec<_>) = records
         .into_iter()
         .partition(|r| r["relation_type"] == "friend");
-    Ok(Json(json!({"friends":friends,"blocks":blocks})))
+    // Players who added this user as a friend, so cards can tell one-way from mutual.
+    let friended_by = sqlx::query_scalar::<_, i64>("SELECT r.user_id FROM user_relationships r JOIN users u ON u.id=r.user_id WHERE r.target_id=$1 AND r.relation_type='friend' AND NOT u.is_restricted")
+        .bind(user.id).fetch_all(&state.db).await?;
+    Ok(Json(
+        json!({"friends":friends,"blocks":blocks,"friended_by":friended_by}),
+    ))
 }
 pub async fn change(
     State(state): State<AppState>,
