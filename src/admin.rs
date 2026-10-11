@@ -670,6 +670,9 @@ pub struct BroadcastInput {
     game: bool,
 }
 
+/// IllyaBot, the system account that speaks for the server in game chat.
+const BOT_ID: i64 = 1_000_000;
+
 /// Staff broadcast: a custom title and message sent to the website, the game, or both.
 pub async fn send_broadcast(
     State(state): State<AppState>,
@@ -740,8 +743,8 @@ pub async fn send_broadcast(
             "INSERT INTO chat_messages(channel_id,user_id,content)
              SELECT id,$1,$2 FROM channels WHERE name='announce'",
         )
-        .bind(actor.id)
-        .bind(content)
+        .bind(BOT_ID)
+        .bind(&content)
         .execute(&mut *tx)
         .await?;
         // In-game delivery is a stable notification popup, queued for every connected session
@@ -759,8 +762,20 @@ pub async fn send_broadcast(
         .execute(&mut *tx)
         .await?
         .rows_affected() as i64;
+        // Lazer has no server popup; its players get the broadcast as a private message from the bot,
+        // which the game shows as a notification.
+        let lazer = sqlx::query(
+            "INSERT INTO protocol_private_messages(sender_id,recipient_id,content,stable_delivery_state)
+             SELECT $1,a.user_id,$2,'legacy' FROM lazer_chat_activity a JOIN users u ON u.id=a.user_id
+             WHERE a.active_until>now() AND NOT u.is_restricted AND a.user_id<>$1",
+        )
+        .bind(BOT_ID)
+        .bind(&content)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() as i64;
         if !input.web {
-            recipients = delivered;
+            recipients = delivered + lazer;
         }
     }
     sqlx::query("UPDATE broadcasts SET recipients=$2 WHERE id=$1")
