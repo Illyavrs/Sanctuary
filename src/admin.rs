@@ -420,6 +420,7 @@ const ROLE_ICONS: &[&str] = &[
     "swords",
     "rocket",
     "leaf",
+    "bot",
 ];
 fn i18n_json(input: &RoleInput) -> Value {
     // Blank entries mean "use the fallback", so they are not stored.
