@@ -908,8 +908,79 @@ fn relax_adjusted_pp(attributes: &rosu_pp::any::PerformanceAttributes, score: &S
     }
 }
 
+struct UpdateManiaResults;
+impl rosu_pp_update::any::HitResultGenerator<rosu_pp_update::mania::Mania> for UpdateManiaResults {
+    fn generate_hitresults(
+        input: rosu_pp_update::mania::InspectManiaPerformance<'_>,
+    ) -> rosu_pp_update::mania::ManiaHitResults {
+        rosu_pp_update::mania::ManiaHitResults {
+            n320: input.n320.unwrap_or(0),
+            n300: input.n300.unwrap_or(0),
+            n200: input.n200.unwrap_or(0),
+            n100: input.n100.unwrap_or(0),
+            n50: input.n50.unwrap_or(0),
+            misses: input.misses.unwrap_or(0),
+        }
+    }
+}
+
+/// Vanilla performance uses the latest Bancho algorithm (rosu-pp `pp-update`).
+/// Validation, score scales and Relax stay on the established rosu-pp 4 path.
+fn update_vanilla_pp(
+    bytes: &[u8],
+    score: &Submission,
+    mods: rosu_pp_update::GameMods,
+    lazer: bool,
+) -> ApiResult<f64> {
+    use rosu_pp_update::model::mode::GameMode;
+    let map = rosu_pp_update::Beatmap::from_bytes(bytes)
+        .map_err(|_| ApiError::bad("Stored map is invalid."))?;
+    let mode = match score.mode {
+        0 => GameMode::Osu,
+        1 => GameMode::Taiko,
+        2 => GameMode::Catch,
+        3 => GameMode::Mania,
+        _ => return Err(ApiError::bad("Unsupported ruleset.")),
+    };
+    let map = map
+        .convert(mode, &mods)
+        .map_err(|_| ApiError::bad("This beatmap cannot be converted to the requested ruleset."))?;
+    let attrs = rosu_pp_update::Difficulty::new()
+        .mods(mods.clone())
+        .lazer(lazer)
+        .checked_calculate(&map)
+        .map_err(|_| ApiError::bad("Beatmap exceeds safe calculation limits."))?;
+    let h = &score.hit_counts;
+    let state = rosu_pp_update::any::ScoreState {
+        max_combo: score.max_combo,
+        n300: h.n300,
+        n100: h.n100,
+        n50: h.n50,
+        misses: h.misses,
+        n_geki: h.geki,
+        n_katu: h.katu,
+        osu_large_tick_hits: h.large_tick_hits,
+        osu_small_tick_hits: h.small_tick_hits,
+        slider_end_hits: h.slider_end_hits,
+        legacy_total_score: u32::try_from(score.score).ok(),
+    };
+    let performance = rosu_pp_update::Performance::new(attrs)
+        .mods(mods)
+        .lazer(lazer)
+        .state(state);
+    Ok(match performance {
+        rosu_pp_update::Performance::Mania(p) if lazer => {
+            p.hitresult_generator::<UpdateManiaResults>()
+                .calculate()
+                .map_err(|_| ApiError::bad("Native mania performance attributes are invalid."))?
+                .pp
+        }
+        other => other.calculate().pp(),
+    })
+}
+
 /// Stored with every score so operators can find the ones calculated by an older method.
-pub(crate) const PP_VERSION_VANILLA: &str = "rosu_pp4.v1";
+pub(crate) const PP_VERSION_VANILLA: &str = "rosu_pp.pp_update.072ed25.v1";
 pub(crate) const PP_VERSION_RELAX: &str = "rosu_pp4.relax.sunrise.v1";
 
 pub(crate) fn pp_version(variant: ScoreVariant) -> &'static str {
@@ -934,6 +1005,7 @@ pub(crate) fn calculate_score(
         3 => rosu_pp::model::mode::GameMode::Mania,
         _ => return Err(ApiError::bad("Unsupported ruleset.")),
     };
+    let mut update_mods = None;
     let mods = if let Some(ref native) = score.api_mods {
         if !lazer {
             return Err(ApiError::bad(
@@ -946,10 +1018,12 @@ pub(crate) fn calculate_score(
                 "Legacy mod projection does not match native mods.",
             ));
         }
+        update_mods = Some(rosu_pp_update::GameMods::from(validated.mods.clone()));
         rosu_pp::GameMods::from(validated.mods)
     } else {
         rosu_pp::GameMods::from(score.mods)
     };
+    let update_mods = update_mods.unwrap_or_else(|| rosu_pp_update::GameMods::from(score.mods));
     let scales_map = map.clone();
     let map = map
         .convert(mode, &mods)
@@ -1017,24 +1091,23 @@ pub(crate) fn calculate_score(
         slider_end_hits: h.slider_end_hits,
         legacy_total_score: u32::try_from(score.score).ok(),
     };
-    let performance = rosu_pp::Performance::new(attrs)
-        .mods(mods)
-        .lazer(lazer)
-        .state(state);
-    let pp = match performance {
-        rosu_pp::Performance::Mania(p) if lazer => {
-            p.hitresult_generator::<NativeManiaResults>()
-                .calculate()
-                .map_err(|_| ApiError::bad("Native mania performance attributes are invalid."))?
-                .pp
-        }
-        other => {
-            let attributes = other.calculate();
-            if variant == ScoreVariant::Relax {
-                relax_adjusted_pp(&attributes, score)
-            } else {
-                attributes.pp()
+    let pp = if variant == ScoreVariant::Vanilla {
+        update_vanilla_pp(bytes, score, update_mods, lazer)?
+    } else {
+        let performance = rosu_pp::Performance::new(attrs)
+            .mods(mods)
+            .lazer(lazer)
+            .state(state);
+        match performance {
+            rosu_pp::Performance::Mania(p) if lazer => {
+                p.hitresult_generator::<NativeManiaResults>()
+                    .calculate()
+                    .map_err(|_| {
+                        ApiError::bad("Native mania performance attributes are invalid.")
+                    })?
+                    .pp
             }
+            other => relax_adjusted_pp(&other.calculate(), score),
         }
     };
     if !pp.is_finite() {

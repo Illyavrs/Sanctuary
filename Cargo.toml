@@ -21,6 +21,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rosu-pp = "4"
+# Vanilla performance follows the latest Bancho algorithm; Relax keeps the Sunrise adjustment on rosu-pp 4.
+rosu-pp-update = { package = "rosu-pp", git = "https://github.com/MaxOhn/rosu-pp", rev = "072ed255fa043aba495212c441030dc7a5e61469" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 encoding_rs = "0.8"
 crc32fast = "1"
