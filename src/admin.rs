@@ -308,8 +308,6 @@ pub async fn public_groups(State(state): State<AppState>) -> ApiResult {
                     SELECT jsonb_agg(({card}) - 'groups' ORDER BY lower(u.username))
                     FROM user_roles ur JOIN users u ON u.id=ur.user_id
                     WHERE ur.role_id=r.id AND NOT u.is_restricted
-                        AND r.rank=(SELECT max(r2.rank) FROM roles r2 JOIN user_roles ur2 ON ur2.role_id=r2.id
-                            WHERE ur2.user_id=u.id AND r2.display_badge)
                 ),'[]'::jsonb)) g
             FROM roles r WHERE r.display_badge
         ) groups",
