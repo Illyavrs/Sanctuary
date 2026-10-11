@@ -880,6 +880,25 @@ impl rosu_pp::any::HitResultGenerator<rosu_pp::mania::Mania> for NativeManiaResu
     }
 }
 
+/// Sunrise removes the Relax mod before asking rosu-pp for skill values and then recombines them
+/// itself; leaving it in would let the library apply its own Relax reductions a second time.
+const RELAX_MOD_BIT: u32 = 128;
+
+fn relax_free_mods(ruleset: u8, native: &Value) -> ApiResult<rosu_pp::GameMods> {
+    let filtered = Value::Array(
+        native
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["acronym"] != "RX")
+            .cloned()
+            .collect(),
+    );
+    ValidatedMods::parse(ruleset, &filtered)
+        .map(|validated| rosu_pp::GameMods::from(validated.mods))
+        .map_err(ApiError::bad)
+}
+
 /// Relax osu!standard and osu!catch use the Sunrise-derived adjustment in
 /// `illya_domain::relax_pp`; other rulesets keep the library value.
 fn relax_adjusted_pp(attributes: &rosu_pp::any::PerformanceAttributes, score: &Submission) -> f64 {
@@ -981,7 +1000,7 @@ fn update_vanilla_pp(
 
 /// Stored with every score so operators can find the ones calculated by an older method.
 pub(crate) const PP_VERSION_VANILLA: &str = "rosu_pp.pp_update.072ed25.v1";
-pub(crate) const PP_VERSION_RELAX: &str = "rosu_pp4.relax.sunrise.v1";
+pub(crate) const PP_VERSION_RELAX: &str = "rosu_pp4.relax.sunrise.v2";
 
 pub(crate) fn pp_version(variant: ScoreVariant) -> &'static str {
     match variant {
@@ -1019,7 +1038,13 @@ pub(crate) fn calculate_score(
             ));
         }
         update_mods = Some(rosu_pp_update::GameMods::from(validated.mods.clone()));
-        rosu_pp::GameMods::from(validated.mods)
+        if variant == ScoreVariant::Relax {
+            relax_free_mods(score.mode as u8, native)?
+        } else {
+            rosu_pp::GameMods::from(validated.mods)
+        }
+    } else if variant == ScoreVariant::Relax {
+        rosu_pp::GameMods::from(score.mods & !RELAX_MOD_BIT)
     } else {
         rosu_pp::GameMods::from(score.mods)
     };
