@@ -71,7 +71,7 @@ pub async fn users(
             'is_restricted',u.is_restricted,'joined_at',u.joined_at,
             'roles',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name) ORDER BY r.id)
                 FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id),'[]'),
-            'can_manage_roles',$6 AND authority.covered AND authority.target_rank<$11,
+            'can_manage_roles',$6 AND authority.covered AND (authority.target_rank<$11 OR (u.id=$9 AND authority.is_super)),
             'can_moderate',$7 AND u.id<>$9 AND (NOT authority.wildcard OR '*'=ANY($10)) AND authority.target_rank<$11,
             'can_revoke_sessions',$8 AND authority.covered AND (u.id=$9 OR authority.target_rank<$11)
         ) || CASE WHEN $3 THEN jsonb_build_object('email',u.email) ELSE '{}'::jsonb END
@@ -83,7 +83,10 @@ pub async fn users(
             ) covered, EXISTS(
                 SELECT 1 FROM roles r JOIN user_roles ur ON ur.role_id=r.id
                 WHERE ur.user_id=u.id AND '*'=ANY(r.permissions)
-            ) wildcard, COALESCE((
+            ) wildcard, EXISTS(
+                SELECT 1 FROM roles r JOIN user_roles ur ON ur.role_id=r.id
+                WHERE ur.user_id=u.id AND r.name='super_user'
+            ) is_super, COALESCE((
                 SELECT max(r.rank) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id
             ),0) target_rank
         ) authority
@@ -239,12 +242,38 @@ pub async fn update_user(
         .fetch_all(&mut *tx)
         .await?;
         can_delegate(&user.permissions, &delegated)?;
-        let highest: i32 =
-            sqlx::query_scalar("SELECT COALESCE(max(rank),0) FROM roles WHERE id=ANY($1)")
-                .bind(roles)
-                .fetch_one(&mut *tx)
-                .await?;
-        outranks(actor_rank, target_rank)?;
+        // The super user may reshape their own roles, but never drop super_user itself
+        // (that only happens through the transfer command), so rank checks skip that role.
+        let self_super: bool = id == user.id
+            && sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1 AND r.name='super_user')",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if self_super {
+            let keeps: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM roles WHERE id=ANY($1) AND name='super_user')",
+            )
+            .bind(roles)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !keeps {
+                return Err(ApiError::bad(
+                    "The super user role cannot be removed here; transfer it with the command line.",
+                ));
+            }
+        }
+        let highest: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(max(rank),0) FROM roles WHERE id=ANY($1) AND ($2 IS FALSE OR name<>'super_user')",
+        )
+        .bind(roles)
+        .bind(self_super)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !self_super {
+            outranks(actor_rank, target_rank)?;
+        }
         outranks(actor_rank, highest)?;
         sqlx::query("DELETE FROM user_roles WHERE user_id=$1")
             .bind(id)
