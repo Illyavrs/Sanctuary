@@ -275,6 +275,7 @@ async fn fixture_checks(db: PgPool, application: String) {
     }
     let private = get(&app, "/api/v1/me", Some(&owner_cookie)).await;
     let mut expected_preferences = preferences.clone();
+    expected_preferences["bancho_rank"] = json!(false);
     expected_preferences["background_color"] = json!("#000000");
     assert_eq!(private["preferences"], expected_preferences);
     assert_eq!(private["locale"], "ja");
