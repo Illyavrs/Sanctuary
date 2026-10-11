@@ -352,15 +352,37 @@ pub async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> A
     if input.username.len() > 254 || input.password.len() > 128 {
         return Err(ApiError::unauthorized());
     }
-    let row=sqlx::query("SELECT id,password_hash,is_restricted FROM users WHERE lower(username)=lower($1) OR lower(email)=lower($1)").bind(input.username.trim()).fetch_optional(&state.db).await?;
+    let row=sqlx::query("SELECT id,password_hash,password_md5_hash,is_restricted FROM users WHERE lower(username)=lower($1) OR lower(email)=lower($1)").bind(input.username.trim()).fetch_optional(&state.db).await?;
     let Some(row) = row else {
         // Spend one password verification on unknown accounts too.
         let _=verify(input.password,"$argon2id$v=19$m=19456,t=2,p=1$MTIzNDU2Nzg5MGFiY2RlZg$HsHQAI/BTc+rAoLRycoM5qNHkmguCeOIW7+NXhszGsE".into()).await;
         return Err(ApiError::unauthorized());
     };
-    let credential: String = row.get("password_hash");
-    if !verify(input.password, credential.clone()).await || row.get::<bool, _>("is_restricted") {
+    let mut credential: String = row.get("password_hash");
+    let verified = verify(input.password.clone(), credential.clone()).await;
+    if row.get::<bool, _>("is_restricted") {
         return Err(ApiError::unauthorized());
+    }
+    if !verified {
+        // Accounts imported from another server only carry the MD5-derived credential that
+        // the game client already sends, so accepting it here exposes no new secret.
+        let md5 = format!("{:x}", md5::compute(input.password.as_bytes()));
+        if !verify(md5, row.get("password_md5_hash")).await {
+            return Err(ApiError::unauthorized());
+        }
+        let (upgraded, _) = hash_password(input.password).await?;
+        let changed =
+            sqlx::query("UPDATE users SET password_hash=$3 WHERE id=$1 AND password_hash=$2")
+                .bind(row.get::<i64, _>("id"))
+                .bind(&credential)
+                .bind(&upgraded)
+                .execute(&state.db)
+                .await?
+                .rows_affected();
+        if changed != 1 {
+            return Err(ApiError::unauthorized());
+        }
+        credential = upgraded;
     }
     session(&state, row.get("id"), &credential).await
 }
