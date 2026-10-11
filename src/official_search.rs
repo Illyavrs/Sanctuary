@@ -1595,6 +1595,7 @@ async fn discovery_result(
     crate::server_catalogue::verify_epoch(state, epoch).await?;
     bounded_discovery(result)
 }
+#[allow(clippy::too_many_arguments)]
 async fn upstream_page(
     state: &AppState,
     key: &SearchKey,

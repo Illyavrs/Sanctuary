@@ -848,8 +848,11 @@ pub(crate) async fn staff_local_sets(
     }
     .bounds();
     let row=sqlx::query(r#"WITH matching AS MATERIALIZED (
-        SELECT b.* FROM beatmaps b WHERE source='local' AND official_id IS NULL AND official_set_id IS NULL
-            AND uploaded_by IS NOT NULL AND native_set_id>=2000000000
+        SELECT b.* FROM beatmaps b WHERE (
+                (source='local' AND official_id IS NULL AND official_set_id IS NULL
+                    AND uploaded_by IS NOT NULL AND native_set_id>=2000000000)
+                -- A withdrawn official set is hidden everywhere else, so staff need a way back to it.
+                OR (source='official' AND NOT illya_beatmapset_active(native_set_id)))
             AND ($1::text IS NULL OR EXISTS(SELECT 1 FROM beatmaps matched WHERE matched.native_set_id=b.native_set_id
                 AND (matched.title ILIKE $1 OR matched.artist ILIKE $1 OR matched.creator ILIKE $1 OR matched.version ILIKE $1)))
             AND ($2='all' OR ($2='active' AND illya_beatmapset_active(native_set_id))
@@ -861,9 +864,10 @@ pub(crate) async fn staff_local_sets(
         'representative_id',g.representative_id,'title',b.title,'artist',b.artist,'creator',b.creator,
         'difficulty_count',g.difficulty_count,'statuses',g.statuses,'added_at',g.added_at,
         'withdrawn',NOT illya_beatmapset_active(g.native_set_id),
-        'uploaded_by',jsonb_build_object('id',u.id,'username',u.username,'country',u.country,'avatar_url',u.avatar_url))
+        'official',b.source='official',
+        'uploaded_by',CASE WHEN u.id IS NULL THEN NULL ELSE jsonb_build_object('id',u.id,'username',u.username,'country',u.country,'avatar_url',u.avatar_url) END)
         ORDER BY g.added_at DESC,g.native_set_id DESC) FROM selected g JOIN matching b ON b.id=g.representative_id
-        JOIN users u ON u.id=b.uploaded_by),'[]'::jsonb) items,(SELECT count(*) FROM grouped) total"#)
+        LEFT JOIN users u ON u.id=b.uploaded_by),'[]'::jsonb) items,(SELECT count(*) FROM grouped) total"#)
         .bind(q).bind(available).bind(size).bind(offset).fetch_one(&state.db).await?;
     let items: Value = row.try_get("items")?;
     Ok(page(

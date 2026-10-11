@@ -13,7 +13,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::NaiveDate;
-use illya_domain::ScoreVariant;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row, postgres::PgRow};
@@ -713,6 +712,7 @@ pub(crate) fn start(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use illya_domain::ScoreVariant;
 
     fn input() -> FilterInput {
         FilterInput::default()
