@@ -549,6 +549,124 @@ pub async fn revoke_user_sessions(
     tx.commit().await?;
     Ok(Json(json!({"ok":true,"revoked":revoked})))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BroadcastInput {
+    title: String,
+    message: String,
+    /// Deliver as a website notification to every unrestricted player.
+    web: bool,
+    /// Post to the in-game `announce` channel that stable and lazer clients can read.
+    game: bool,
+}
+
+/// Staff broadcast: a custom title and message sent to the website, the game, or both.
+pub async fn send_broadcast(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<BroadcastInput>,
+) -> ApiResult {
+    let user = auth::require(&state, &headers).await?;
+    user.require("broadcast.send")?;
+    let title = input.title.trim();
+    let message = input.message.trim();
+    let invalid_text = |value: &str| value.chars().any(|c| c.is_control() && c != '\n');
+    if title.is_empty()
+        || title.chars().count() > 120
+        || message.is_empty()
+        || message.chars().count() > 800
+        || invalid_text(title)
+        || invalid_text(message)
+        || !(input.web || input.game)
+    {
+        return Err(ApiError::bad(
+            "Supply a title (up to 120 characters), a message (up to 800) and at least one destination.",
+        ));
+    }
+    let mut tx = state.db.begin().await?;
+    let actor = auth::mutation_actor(&mut tx, &user, &[], auth::MutationScope::Permissions).await?;
+    actor.require("broadcast.send")?;
+    let recent: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM broadcasts WHERE sender_id=$1 AND created_at>clock_timestamp()-interval '30 seconds')",
+    )
+    .bind(actor.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if recent {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "broadcast_cooldown",
+            "Wait 30 seconds before sending another broadcast.".into(),
+        ));
+    }
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO broadcasts(sender_id,title,message,to_web,to_game) VALUES($1,$2,$3,$4,$5) RETURNING id",
+    )
+    .bind(actor.id)
+    .bind(title)
+    .bind(message)
+    .bind(input.web)
+    .bind(input.game)
+    .fetch_one(&mut *tx)
+    .await?;
+    let mut recipients: i64 = 0;
+    if input.web {
+        recipients = sqlx::query(
+            "INSERT INTO user_notifications(user_id,event_key,kind,broadcast_id,title,message)
+             SELECT id,'broadcast:'||$1::text,'broadcast',$1,$2,$3 FROM users WHERE NOT is_restricted",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(message)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() as i64;
+    }
+    if input.game {
+        let line = format!("[{title}] {}", message.replace('\n', " "));
+        let content: String = line.chars().take(1000).collect();
+        sqlx::query(
+            "INSERT INTO chat_messages(channel_id,user_id,content)
+             SELECT id,$1,$2 FROM channels WHERE name='announce'",
+        )
+        .bind(actor.id)
+        .bind(content)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE broadcasts SET recipients=$2 WHERE id=$1")
+        .bind(id)
+        .bind(recipients as i32)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'broadcasts.send','broadcast',$2,$3)")
+        .bind(actor.id)
+        .bind(id.to_string())
+        .bind(json!({"title":title,"web":input.web,"game":input.game,"recipients":recipients}))
+        .execute(&mut *tx)
+        .await?;
+    auth::ensure_mutation_actor(&mut tx, &actor).await?;
+    tx.commit().await?;
+    Ok(Json(
+        json!({"id":id,"recipients":recipients,"web":input.web,"game":input.game}),
+    ))
+}
+
+pub async fn list_broadcasts(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
+    let user = auth::require(&state, &headers).await?;
+    user.require("broadcast.send")?;
+    let items = sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(jsonb_agg(b ORDER BY (b->>'id')::bigint DESC),'[]'::jsonb) FROM (
+            SELECT jsonb_build_object('id',x.id,'title',x.title,'message',x.message,'web',x.to_web,
+                'game',x.to_game,'recipients',x.recipients,'created_at',x.created_at,
+                'sender',u.username) b
+            FROM broadcasts x JOIN users u ON u.id=x.sender_id ORDER BY x.id DESC LIMIT 20) recent",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(json!({ "items": items })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

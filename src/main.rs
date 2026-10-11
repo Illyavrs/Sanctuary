@@ -561,6 +561,10 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/v1/leaderboard/top-plays", get(scores::top_plays))
         .route("/api/v1/groups", get(admin::public_groups))
+        .route(
+            "/api/v1/admin/broadcasts",
+            get(admin::list_broadcasts).post(admin::send_broadcast),
+        )
         .route("/api/v1/leaderboard", get(scores::leaderboard))
         .route("/api/v1/channels", get(chat::channels))
         .route(

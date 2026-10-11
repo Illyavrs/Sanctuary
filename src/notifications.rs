@@ -154,6 +154,9 @@ const ELIGIBLE: &str = r#"(
         SELECT 1 FROM announcements a JOIN users recipient ON recipient.id=n.user_id
         WHERE a.id=n.announcement_id AND a.status='published'
             AND a.published_at=n.publication_at AND recipient.joined_at<=n.publication_at))
+    OR (n.kind='private_message' AND EXISTS (
+        SELECT 1 FROM users s WHERE s.id=n.sender_id AND NOT s.is_restricted))
+    OR (n.kind='broadcast' AND EXISTS (SELECT 1 FROM broadcasts b WHERE b.id=n.broadcast_id))
 )"#;
 
 pub(crate) async fn list(
@@ -174,6 +177,8 @@ pub(crate) async fn list(
         SELECT COALESCE((SELECT jsonb_agg(jsonb_build_object(
             'id',n.id,'kind',n.kind,'title',n.title,'message',n.message,
             'href',CASE WHEN n.kind='announcement_published' THEN '/news/' || n.announcement_id
+                WHEN n.kind='private_message' THEN '/users/' || n.sender_id
+                WHEN n.kind='broadcast' THEN NULL
                 ELSE (SELECT '/beatmapsets/' || CASE WHEN r.source='local' THEN 'local-' ELSE '' END || r.native_set_id
                     FROM beatmap_rank_requests r WHERE r.id=n.rank_request_id) END,
             'created_at',n.created_at,'read_at',n.read_at) ORDER BY n.id DESC)
