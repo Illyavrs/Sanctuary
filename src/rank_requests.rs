@@ -895,7 +895,12 @@ pub(crate) async fn review(
     if input.expected_revision < 0 {
         return Err(ApiError::bad("Supply a non-negative request revision."));
     }
-    let reason = reason(&input.reason)?;
+    // Approving needs no explanation; rejecting does.
+    let reason = if input.decision == "approved" && input.reason.trim().is_empty() {
+        "Approved"
+    } else {
+        reason(&input.reason)?
+    };
     let selected = if input.decision == "approved" {
         user.require("beatmaps.moderate")?;
         let ids = validated_ids(

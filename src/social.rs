@@ -29,7 +29,7 @@ pub struct Change {
 
 /// Player-card JSON shared by the friends list and the online list: identity, banner and
 /// the highest-ranked badge group, plus whether a game client is connected right now.
-pub const CARD: &str = "jsonb_build_object('id',u.id,'username',u.username,'avatar_url',u.avatar_url,'country',u.country,'banner_url',u.banner_url,'banner_position_x',u.banner_position_x,'banner_position_y',u.banner_position_y,'accent_color',u.accent_color,'online',EXISTS(SELECT 1 FROM bancho_sessions b WHERE b.user_id=u.id AND b.expires_at>now()) OR EXISTS(SELECT 1 FROM lazer_sessions l WHERE l.user_id=u.id AND l.access_expires_at>now() AND l.last_seen_at>now()-interval '3 minutes'),'groups',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name,'short_name',r.short_name,'colour',r.colour,'icon',r.icon) ORDER BY r.rank DESC,r.id) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id AND r.display_badge),'[]'::jsonb))";
+pub const CARD: &str = "jsonb_build_object('id',u.id,'username',u.username,'avatar_url',u.avatar_url,'country',u.country,'banner_url',u.banner_url,'banner_position_x',u.banner_position_x,'banner_position_y',u.banner_position_y,'accent_color',u.accent_color,'online',u.is_bot OR EXISTS(SELECT 1 FROM bancho_sessions b WHERE b.user_id=u.id AND b.expires_at>now()) OR EXISTS(SELECT 1 FROM lazer_sessions l WHERE l.user_id=u.id AND l.access_expires_at>now() AND l.last_seen_at>now()-interval '3 minutes'),'groups',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name,'short_name',r.short_name,'colour',r.colour,'icon',r.icon) ORDER BY r.rank DESC,r.id) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id AND r.display_badge),'[]'::jsonb))";
 
 #[derive(Deserialize)]
 pub struct OnlineQuery {
@@ -41,7 +41,7 @@ pub struct OnlineQuery {
 pub async fn online(State(state): State<AppState>, Query(query): Query<OnlineQuery>) -> ApiResult {
     let size = query.page_size.unwrap_or(24).clamp(1, 60);
     let offset = (query.page.unwrap_or(1).max(1) - 1) * size;
-    let active = "SELECT user_id FROM bancho_sessions WHERE expires_at>now() UNION SELECT user_id FROM lazer_sessions WHERE access_expires_at>now() AND last_seen_at>now()-interval '3 minutes'";
+    let active = "SELECT id FROM users WHERE is_bot UNION SELECT user_id FROM bancho_sessions WHERE expires_at>now() UNION SELECT user_id FROM lazer_sessions WHERE access_expires_at>now() AND last_seen_at>now()-interval '3 minutes'";
     let total: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM users u WHERE NOT u.is_restricted AND u.id IN ({active})"
     ))
