@@ -733,16 +733,24 @@ pub async fn send_broadcast(
         .rows_affected() as i64;
     }
     if input.game {
-        let line = format!("[{title}] {}", message.replace('\n', " "));
-        let content: String = line.chars().take(1000).collect();
-        sqlx::query(
-            "INSERT INTO chat_messages(channel_id,user_id,content)
-             SELECT id,$1,$2 FROM channels WHERE name='announce'",
+        // In-game delivery is a stable notification popup, queued for every connected session
+        // exactly like the welcome notice shown at login. It is picked up on the next poll.
+        let packet = resonance_protocol::stable::string_packet(
+            resonance_protocol::stable::server::NOTIFICATION,
+            &format!("{title}\n{message}"),
         )
-        .bind(actor.id)
-        .bind(content)
+        .map_err(|_| ApiError::bad("The broadcast cannot be shown in game."))?;
+        let delivered = sqlx::query(
+            "INSERT INTO bancho_packet_queue(user_id,payload,expires_at)
+             SELECT DISTINCT user_id,$1,now()+interval '10 minutes' FROM bancho_sessions WHERE expires_at>now()",
+        )
+        .bind(packet)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected() as i64;
+        if !input.web {
+            recipients = delivered;
+        }
     }
     sqlx::query("UPDATE broadcasts SET recipients=$2 WHERE id=$1")
         .bind(id)
