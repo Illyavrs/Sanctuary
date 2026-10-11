@@ -214,14 +214,14 @@ pub(crate) async fn profile_in_variant(
     variant: ScoreVariant,
 ) -> ApiResult<Value> {
     scores::validate_partition(mode, variant)?;
-    let row=sqlx::query("SELECT id,username,email,email_verified_at,country,bio,avatar_url,banner_url,accent_color,banner_position_x,banner_position_y,preferences,joined_at,is_restricted FROM users WHERE id=$1 AND ($2 OR NOT is_restricted)")
+    let row=sqlx::query("SELECT id,username,email,email_verified_at,country,bio,avatar_url,banner_url,accent_color,banner_position_x,banner_position_y,preferred_mode,preferred_variant,preferences,joined_at,is_restricted FROM users WHERE id=$1 AND ($2 OR NOT is_restricted)")
         .bind(id).bind(private).fetch_optional(&state.db).await?.ok_or_else(ApiError::missing)?;
     let roles=sqlx::query_scalar::<_,String>("SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 ORDER BY r.id").bind(id).fetch_all(&state.db).await?;
     let permissions=sqlx::query_scalar::<_,String>("SELECT DISTINCT unnest(r.permissions) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1").bind(id).fetch_all(&state.db).await?;
     let stats = scores::statistics(state, id, mode, variant).await?;
     let preferences: Preferences =
         serde_json::from_value(row.get::<Value, _>("preferences")).unwrap_or_default();
-    let mut value = json!({"id":id,"username":row.get::<String,_>("username"),"country":row.get::<String,_>("country"),"bio":row.get::<String,_>("bio"),"avatar_url":row.get::<Option<String>,_>("avatar_url"),"banner_url":row.get::<Option<String>,_>("banner_url"),"accent_color":row.get::<String,_>("accent_color"),"banner_position_x":row.get::<i32,_>("banner_position_x"),"banner_position_y":row.get::<i32,_>("banner_position_y"),"roles":roles,"joined_at":row.get::<chrono::DateTime<Utc>,_>("joined_at"),"pp":stats["pp"],"play_count":stats["play_count"],"accuracy":stats["accuracy"],"statistics":stats});
+    let mut value = json!({"id":id,"username":row.get::<String,_>("username"),"country":row.get::<String,_>("country"),"bio":row.get::<String,_>("bio"),"avatar_url":row.get::<Option<String>,_>("avatar_url"),"banner_url":row.get::<Option<String>,_>("banner_url"),"accent_color":row.get::<String,_>("accent_color"),"banner_position_x":row.get::<i32,_>("banner_position_x"),"banner_position_y":row.get::<i32,_>("banner_position_y"),"preferred_mode":row.get::<i16,_>("preferred_mode"),"preferred_variant":row.get::<String,_>("preferred_variant"),"roles":roles,"joined_at":row.get::<chrono::DateTime<Utc>,_>("joined_at"),"pp":stats["pp"],"play_count":stats["play_count"],"accuracy":stats["accuracy"],"statistics":stats});
     // Only roles flagged as badges are public; the rest stay permission plumbing.
     let groups = sqlx::query("SELECT r.id,r.name,r.short_name,r.colour,r.icon FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 AND r.display_badge ORDER BY r.rank DESC,r.id")
         .bind(id).fetch_all(&state.db).await?;
@@ -479,6 +479,8 @@ pub struct ProfilePatch {
     accent_color: Option<String>,
     banner_position_x: Option<i32>,
     banner_position_y: Option<i32>,
+    preferred_mode: Option<i16>,
+    preferred_variant: Option<String>,
 }
 pub async fn update_profile(
     State(state): State<AppState>,
@@ -518,9 +520,22 @@ pub async fn update_profile(
             "Banner positions must be integers from 0 to 100.",
         ));
     }
+    // The pair is validated together: mania has no Relax partition.
+    if input.preferred_mode.is_some() != input.preferred_variant.is_some() {
+        return Err(ApiError::bad(
+            "Send the preferred mode and variant together.",
+        ));
+    }
+    if let (Some(mode), Some(variant)) = (input.preferred_mode, input.preferred_variant.as_deref())
+        && (!(0..=3).contains(&mode)
+            || !matches!(variant, "vanilla" | "relax")
+            || (mode == 3 && variant == "relax"))
+    {
+        return Err(ApiError::bad("Choose a valid preferred mode."));
+    }
     let mut tx = state.db.begin().await?;
     let user = mutation_actor(&mut tx, &user, &[], MutationScope::Session).await?;
-    sqlx::query("UPDATE users SET bio=COALESCE($2,bio),country=COALESCE($3,country),accent_color=COALESCE($4,accent_color),banner_position_x=COALESCE($5,banner_position_x),banner_position_y=COALESCE($6,banner_position_y) WHERE id=$1").bind(user.id).bind(input.bio).bind(input.country).bind(input.accent_color).bind(input.banner_position_x).bind(input.banner_position_y).execute(&mut *tx).await?;
+    sqlx::query("UPDATE users SET bio=COALESCE($2,bio),country=COALESCE($3,country),accent_color=COALESCE($4,accent_color),banner_position_x=COALESCE($5,banner_position_x),banner_position_y=COALESCE($6,banner_position_y),preferred_mode=COALESCE($7,preferred_mode),preferred_variant=COALESCE($8,preferred_variant) WHERE id=$1").bind(user.id).bind(input.bio).bind(input.country).bind(input.accent_color).bind(input.banner_position_x).bind(input.banner_position_y).bind(input.preferred_mode).bind(&input.preferred_variant).execute(&mut *tx).await?;
     ensure_mutation_actor(&mut tx, &user).await?;
     tx.commit().await?;
     Ok(Json(profile(&state, user.id, true).await?))
