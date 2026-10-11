@@ -484,7 +484,9 @@ async fn bulk_recalculation_filters_runs_and_guards_authority() {
         assert_eq!(request(&app, Method::GET, jobs, Some(moderator_cookie), None).await.0, StatusCode::FORBIDDEN);
     }).catch_unwind().await;
     db.close().await;
-    let drop_schema = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&control).await;
+    let drop_schema = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&control)
+        .await;
     control.close().await;
     if test_root.exists() {
         tokio::fs::remove_dir_all(&test_root).await.unwrap();

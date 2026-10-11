@@ -1212,8 +1212,14 @@ pub async fn recalculate_relax(
         }
         let previous = row.get::<f64, _>("pp");
         let previous_eligible = row.get::<bool, _>("pp_eligible");
-        sqlx::query("UPDATE scores SET pp=$2,pp_eligible=true,pp_calculation_version=$3 WHERE id=$1")
-            .bind(id).bind(pp).bind(PP_VERSION_RELAX).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE scores SET pp=$2,pp_eligible=true,pp_calculation_version=$3 WHERE id=$1",
+        )
+        .bind(id)
+        .bind(pp)
+        .bind(PP_VERSION_RELAX)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'scores.relax_recalculate','score',$2,$3)")
             .bind(operator.id).bind(id.to_string()).bind(json!({"previous_pp":previous,"pp":pp,"previous_pp_eligible":previous_eligible,"pp_eligible":true,"mode":row.get::<i16,_>("mode"),"score_variant":"relax","calculation_version":PP_VERSION_RELAX,"verification_unchanged":true}))
             .execute(&mut *tx).await?;

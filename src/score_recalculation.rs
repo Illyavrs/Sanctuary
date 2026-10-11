@@ -102,9 +102,9 @@ fn bind_match<'q>(query: Query<'q>, f: &'q Filters) -> Query<'q> {
 
 fn finite_pp(value: Option<f64>, label: &str) -> ApiResult<Option<f64>> {
     match value {
-        Some(v) if !v.is_finite() || v < 0.0 => {
-            Err(ApiError::bad(format!("{label} must be a non-negative number.")))
-        }
+        Some(v) if !v.is_finite() || v < 0.0 => Err(ApiError::bad(format!(
+            "{label} must be a non-negative number."
+        ))),
         other => Ok(other),
     }
 }
@@ -125,12 +125,16 @@ fn validate(input: &FilterInput) -> ApiResult<()> {
         .as_deref()
         .is_some_and(|v| !matches!(v, "pending" | "verified" | "all"))
     {
-        return Err(ApiError::bad("Verification must be pending, verified or all."));
+        return Err(ApiError::bad(
+            "Verification must be pending, verified or all.",
+        ));
     }
     if let (Some(from), Some(to)) = (input.from, input.to)
         && from > to
     {
-        return Err(ApiError::bad("The start date must not be after the end date."));
+        return Err(ApiError::bad(
+            "The start date must not be after the end date.",
+        ));
     }
     if let (Some(min), Some(max)) = (input.min_pp, input.max_pp)
         && min > max
@@ -161,7 +165,11 @@ fn validate(input: &FilterInput) -> ApiResult<()> {
 
 async fn resolve(db: &PgPool, input: FilterInput) -> ApiResult<Filters> {
     validate(&input)?;
-    let (user_id, user_name) = match input.user.as_deref().map(str::trim).filter(|u| !u.is_empty())
+    let (user_id, user_name) = match input
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
     {
         None => (None, None),
         Some(user) => {
@@ -471,7 +479,9 @@ async fn recalculate_one(state: &AppState, row: &PgRow) -> ApiResult<Outcome> {
     let submission = scores::from_stored_row(row)?;
     let (variant, eligible) = scores::mod_partition(&submission, &client)?;
     if variant.as_str() != row.get::<String, _>("score_variant") {
-        return Ok(Outcome::Skipped("The mods no longer match the stored score variant."));
+        return Ok(Outcome::Skipped(
+            "The mods no longer match the stored score variant.",
+        ));
     }
     if !eligible {
         return Ok(Outcome::Skipped("These mods are not eligible for pp."));
@@ -505,7 +515,9 @@ async fn recalculate_one(state: &AppState, row: &PgRow) -> ApiResult<Outcome> {
             "pending" | "verified"
         )
     {
-        return Ok(Outcome::Skipped("The score changed while it was being calculated."));
+        return Ok(Outcome::Skipped(
+            "The score changed while it was being calculated.",
+        ));
     }
     let previous: f64 = current.get("pp");
     let previous_eligible: bool = current.get("pp_eligible");
@@ -664,11 +676,21 @@ pub(crate) async fn run_next(state: &AppState) -> Result<bool, sqlx::Error> {
     let Some(id) = claimed else {
         return Ok(false);
     };
-    tracing::info!(code = "score_recalculation_started", job = id, "bulk recalculation started");
+    tracing::info!(
+        code = "score_recalculation_started",
+        job = id,
+        "bulk recalculation started"
+    );
     if let Err(error) = run_job(state, id).await {
         tracing::warn!(code = "score_recalculation_failed", job = id, %error, "bulk recalculation stopped");
         // A broken connection also breaks this write; the job is then resumed after restart.
-        let _ = finish(state, id, "failed", Some("The recalculation stopped after a database error.")).await;
+        let _ = finish(
+            state,
+            id,
+            "failed",
+            Some("The recalculation stopped after a database error."),
+        )
+        .await;
     }
     Ok(true)
 }
@@ -744,7 +766,9 @@ mod tests {
     #[test]
     fn unknown_filter_fields_are_refused() {
         assert!(serde_json::from_value::<FilterInput>(json!({"nope":1})).is_err());
-        assert!(serde_json::from_value::<FilterInput>(json!({"from":"2026-10-01","mode":0})).is_ok());
+        assert!(
+            serde_json::from_value::<FilterInput>(json!({"from":"2026-10-01","mode":0})).is_ok()
+        );
     }
 
     #[test]

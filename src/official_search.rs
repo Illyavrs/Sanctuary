@@ -1566,10 +1566,8 @@ async fn discovery_result(
             // no official rows until they request a second page. Append one
             // upstream page; if upstream is unavailable keep the local prefix
             // and its continuation.
-            if let Ok(upstream) = upstream_page(
-                state, key, headers, user_id, None, true, epoch, local_total,
-            )
-            .await
+            if let Ok(upstream) =
+                upstream_page(state, key, headers, user_id, None, true, epoch, local_total).await
             {
                 let local_count = result.items.len();
                 result.items.extend(upstream.items);
