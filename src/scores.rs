@@ -230,6 +230,51 @@ pub async fn leaderboard(
     Ok(Json(response))
 }
 
+#[derive(Deserialize)]
+pub struct PlaytimeQuery {
+    page: Option<u32>,
+    page_size: Option<u32>,
+    country: Option<String>,
+}
+
+/// Players ranked by total time spent playing, across every mode and score variant.
+pub async fn playtime_leaderboard(
+    State(state): State<AppState>,
+    Query(query): Query<PlaytimeQuery>,
+) -> ApiResult {
+    validate_country(query.country.as_deref())?;
+    let (p, size, offset) = Pagination {
+        page: query.page,
+        page_size: query.page_size,
+    }
+    .bounds();
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT s.user_id) FROM scores s JOIN users u ON u.id=s.user_id AND NOT u.is_restricted          WHERE s.play_seconds IS NOT NULL AND s.verification<>'rejected' AND ($1::text IS NULL OR u.country=$1)",
+    )
+    .bind(&query.country)
+    .fetch_one(&state.db)
+    .await?;
+    let items = sqlx::query_scalar::<_, Value>(
+        "WITH totals AS (
+            SELECT s.user_id,sum(s.play_seconds)::bigint seconds,count(*)::bigint plays
+            FROM scores s JOIN users u ON u.id=s.user_id AND NOT u.is_restricted
+            WHERE s.play_seconds IS NOT NULL AND s.verification<>'rejected' AND ($1::text IS NULL OR u.country=$1)
+            GROUP BY s.user_id
+        ),placed AS (
+            SELECT *,row_number() OVER(ORDER BY seconds DESC,user_id) position FROM totals
+        )
+        SELECT jsonb_build_object('id',u.id,'username',u.username,'country',u.country,'avatar_url',u.avatar_url,
+            'play_time',p.seconds,'play_count',p.plays,'position',p.position)
+        FROM placed p JOIN users u ON u.id=p.user_id ORDER BY p.position LIMIT $2 OFFSET $3",
+    )
+    .bind(&query.country)
+    .bind(i64::from(size))
+    .bind(i64::from(offset))
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(page(items, total, p, size).0))
+}
+
 /// Highest-pp plays across all public players: one best score per player and map.
 pub async fn top_plays(
     State(state): State<AppState>,
@@ -393,9 +438,11 @@ pub(crate) async fn statistics(
     } else {
         None
     };
-    Ok(
-        json!({"mode":mode,"score_variant":variant,"pp":pp,"rank":rank,"global_rank":rank,"country_rank":country_rank,"bancho_rank":bancho_estimate.is_some(),"play_count":plays,"accuracy":stats.get::<f64,_>("accuracy"),"maximum_combo":stats.get::<i32,_>("maximum_combo"),"total_hits":stats.get::<i64,_>("total_hits"),"total_score":if totals_available{Some(stats.get::<i64,_>("total_score"))}else{None},"ranked_score":if totals_available{Some(stats.get::<i64,_>("ranked_score"))}else{None},"score_totals_complete":totals_available&&plays==stats.get::<i64,_>("scaled_plays"),"score_scale":if totals_available{"classic_display"}else{"unavailable_for_relax"},"grade_counts":grades}),
-    )
+    let play_time: i64 = sqlx::query_scalar("SELECT COALESCE(sum(play_seconds),0)::bigint FROM scores WHERE user_id=$1 AND mode=$2 AND score_variant=$3 AND verification<>'rejected'")
+        .bind(user_id).bind(mode).bind(variant.as_str()).fetch_one(&state.db).await?;
+    let mut out = json!({"mode":mode,"score_variant":variant,"pp":pp,"rank":rank,"global_rank":rank,"country_rank":country_rank,"bancho_rank":bancho_estimate.is_some(),"play_count":plays,"accuracy":stats.get::<f64,_>("accuracy"),"maximum_combo":stats.get::<i32,_>("maximum_combo"),"total_hits":stats.get::<i64,_>("total_hits"),"total_score":if totals_available{Some(stats.get::<i64,_>("total_score"))}else{None},"ranked_score":if totals_available{Some(stats.get::<i64,_>("ranked_score"))}else{None},"score_totals_complete":totals_available&&plays==stats.get::<i64,_>("scaled_plays"),"score_scale":if totals_available{"classic_display"}else{"unavailable_for_relax"},"grade_counts":grades});
+    out["play_time"] = json!(play_time);
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -465,6 +512,10 @@ pub struct Submission {
     pub(crate) ingestion_key: Option<String>,
     #[serde(default)]
     pub(crate) client_beatmap_md5: Option<String>,
+    /// Seconds the player reported spending on this play (stable `st`/`ft`); lazer derives it from
+    /// its score token. Never trusted beyond the beatmap's own length.
+    #[serde(default)]
+    pub(crate) play_seconds: Option<i32>,
 }
 fn passed_default() -> bool {
     true
@@ -664,6 +715,9 @@ async fn ingest(
     // ON CONFLICT may observe a winner published after the locked retry lookup.
     // Compare its immutable input before committing even the no-op update.
     ensure_retained_input(&value, user_id, &input, client, variant, &original_md5)?;
+    if let Some(id) = value["id"].as_i64() {
+        record_play_seconds(&mut tx, id, input.play_seconds).await?;
+    }
     if let Some(actor) = &actor {
         auth::ensure_mutation_actor(&mut tx, actor).await?;
     }
@@ -674,6 +728,30 @@ async fn ingest(
         "judgements"
     });
     Ok(value)
+}
+
+/// Play time as the game servers count it: the shorter of the beatmap length (adjusted for rate mods)
+/// and the time actually spent, failed plays included. A reported value (stable) wins, then the time
+/// since the lazer score token was issued, and a pass without either counts the full length.
+async fn record_play_seconds(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    score_id: i64,
+    reported: Option<i32>,
+) -> ApiResult<()> {
+    sqlx::query(
+        "UPDATE scores s SET play_seconds=GREATEST(0,LEAST(c.cap,COALESCE($2::int,
+             CASE WHEN s.client='lazer' THEN EXTRACT(EPOCH FROM (now()-t.created_at))::int END,
+             CASE WHEN s.passed THEN c.cap END)))
+         FROM beatmaps b
+         CROSS JOIN LATERAL (SELECT CEIL(b.length_seconds/CASE WHEN s.mods&(64|512)<>0 THEN 1.5 WHEN s.mods&256<>0 THEN 0.75 ELSE 1 END)::int AS cap) c
+         LEFT JOIN lazer_score_tokens t ON s.ingestion_key LIKE 'lazer:%' AND t.id=NULLIF(split_part(s.ingestion_key,':',2),'')::bigint
+         WHERE s.id=$1 AND b.id=s.beatmap_id AND s.play_seconds IS NULL",
+    )
+    .bind(score_id)
+    .bind(reported.filter(|seconds| (0..=36_000).contains(seconds)))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn retained_submission(
@@ -921,6 +999,7 @@ pub(crate) fn from_stored_row(row: &sqlx::postgres::PgRow) -> ApiResult<Submissi
         client: Some(client),
         ingestion_key: row.try_get("ingestion_key")?,
         client_beatmap_md5: row.try_get("client_beatmap_md5")?,
+        play_seconds: None,
     })
 }
 
@@ -1894,6 +1973,7 @@ mod tests {
                 client: None,
                 ingestion_key: None,
                 client_beatmap_md5: None,
+                play_seconds: None,
             };
             assert!(calculate_pp(bytes, &score, false).unwrap().is_finite());
             score.max_combo = 1000;
@@ -1931,6 +2011,7 @@ mod tests {
             client: None,
             ingestion_key: None,
             client_beatmap_md5: None,
+            play_seconds: None,
         };
         let custom = calculate_pp(map.as_bytes(), &score, true).unwrap();
         score.api_mods = None;

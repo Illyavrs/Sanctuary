@@ -569,6 +569,10 @@ fn router(state: AppState) -> Router {
             post(maps::native_search).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/v1/leaderboard/top-plays", get(scores::top_plays))
+        .route(
+            "/api/v1/leaderboard/playtime",
+            get(scores::playtime_leaderboard),
+        )
         .route("/api/v1/groups", get(admin::public_groups))
         .route(
             "/api/v1/admin/broadcasts",
