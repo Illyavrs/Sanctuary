@@ -297,6 +297,28 @@ pub async fn roles(State(state): State<AppState>, headers: HeaderMap) -> ApiResu
     let total = items.len() as i64;
     Ok(page(items, total, 1, total.max(1)))
 }
+/// Public staff directory: every role that shows a badge, highest rank first, listing its
+/// unrestricted members once under their highest displayed group.
+pub async fn public_groups(State(state): State<AppState>) -> ApiResult {
+    let items = sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(jsonb_agg(g ORDER BY (g->>'rank')::int DESC,(g->>'id')::bigint),'[]'::jsonb) FROM (
+            SELECT jsonb_build_object('id',r.id,'name',r.name,'description',r.description,
+                'short_name',r.short_name,'colour',r.colour,'rank',r.rank,
+                'members',COALESCE((
+                    SELECT jsonb_agg(jsonb_build_object('id',u.id,'username',u.username,
+                        'country',u.country,'avatar_url',u.avatar_url) ORDER BY lower(u.username))
+                    FROM user_roles ur JOIN users u ON u.id=ur.user_id
+                    WHERE ur.role_id=r.id AND NOT u.is_restricted
+                        AND r.rank=(SELECT max(r2.rank) FROM roles r2 JOIN user_roles ur2 ON ur2.role_id=r2.id
+                            WHERE ur2.user_id=u.id AND r2.display_badge)
+                ),'[]'::jsonb)) g
+            FROM roles r WHERE r.display_badge
+        ) groups",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(json!({ "items": items })))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleInput {
