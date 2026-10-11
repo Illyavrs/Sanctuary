@@ -230,6 +230,66 @@ pub async fn leaderboard(
     Ok(Json(response))
 }
 
+/// Highest-pp plays across all public players: one best score per player and map.
+pub async fn top_plays(
+    State(state): State<AppState>,
+    Query(query): Query<LeaderboardQuery>,
+) -> ApiResult {
+    let mode = query.mode.unwrap_or(0);
+    let variant = query.variant.unwrap_or_default();
+    validate_partition(mode, variant)?;
+    validate_country(query.country.as_deref())?;
+    let (p, size, offset) = Pagination {
+        page: query.page,
+        page_size: query.page_size,
+    }
+    .bounds();
+    let mut response = sqlx::query_scalar::<_, Value>(
+        "WITH eligible AS (
+            SELECT s.*,u.username,u.country,u.avatar_url,b.title,b.version,b.artist,
+                b.official_set_id beatmapset_id,b.source beatmap_source,b.native_id native_beatmap_id,b.native_set_id native_beatmapset_id,b.mode beatmap_mode,b.stars,b.max_combo beatmap_max_combo
+            FROM scores s JOIN users u ON u.id=s.user_id AND NOT u.is_restricted
+            JOIN active_beatmaps b ON b.id=s.beatmap_id
+            WHERE s.mode=$1 AND s.score_variant=$2 AND s.verification='verified'
+                AND s.passed AND b.status='ranked' AND s.pp_eligible
+                AND ($3::text IS NULL OR u.country=$3)
+        ),best AS (
+            SELECT DISTINCT ON(user_id,beatmap_id) * FROM eligible
+            ORDER BY user_id,beatmap_id,pp DESC,accuracy DESC,max_combo DESC,id
+        ),positioned AS (
+            SELECT *,row_number() OVER(ORDER BY pp DESC,id) position FROM best
+        ),paged AS MATERIALIZED (
+            SELECT * FROM positioned ORDER BY position LIMIT $4 OFFSET $5
+        )
+        SELECT jsonb_build_object(
+            'total',(SELECT count(*) FROM best),
+            'items',COALESCE((SELECT jsonb_agg(
+                to_jsonb(p)-'replay_path'-'ingestion_key'||jsonb_build_object(
+                    'has_replay',p.replay_path IS NOT NULL,
+                    'accuracy_source',CASE WHEN p.client='lazer' THEN 'client_reported' ELSE 'judgements' END,
+                    'grade',COALESCE(p.native_submission->>'rank',t.submission->>'rank',a.details->>'rank')
+                ) ORDER BY p.position) FROM paged p
+                LEFT JOIN LATERAL(SELECT submission FROM lazer_score_tokens WHERE score_id=p.id ORDER BY id DESC LIMIT 1)t ON true
+                LEFT JOIN LATERAL(SELECT details FROM audit_events WHERE action='scores.stable_ingest' AND target_id=p.id::text ORDER BY id DESC LIMIT 1)a ON true),'[]'::jsonb)
+        )",
+    )
+    .bind(mode)
+    .bind(variant.as_str())
+    .bind(&query.country)
+    .bind(size)
+    .bind(offset)
+    .fetch_one(&state.db)
+    .await?;
+    if let Some(items) = response["items"].as_array_mut() {
+        items.iter_mut().for_each(normalize_score_grade);
+    }
+    response["page"] = json!(p);
+    response["page_size"] = json!(size);
+    response["mode"] = json!(mode);
+    response["score_variant"] = json!(variant);
+    Ok(Json(response))
+}
+
 pub(crate) fn validate_partition(mode: i16, variant: ScoreVariant) -> ApiResult<()> {
     if !(0..=3).contains(&mode) {
         return Err(ApiError::bad("Unsupported mode."));
