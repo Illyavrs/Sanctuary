@@ -59,15 +59,21 @@ pub async fn users(
         .bind(search_id)
         .fetch_one(&state.db)
         .await?;
+    let actor_rank: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(max(r.rank),0) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1",
+    )
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await?;
     let items = sqlx::query_scalar::<_, Value>(r#"
         SELECT jsonb_build_object(
             'id',u.id,'username',u.username,'country',u.country,'avatar_url',u.avatar_url,
             'is_restricted',u.is_restricted,'joined_at',u.joined_at,
             'roles',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name) ORDER BY r.id)
                 FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id),'[]'),
-            'can_manage_roles',$6 AND authority.covered,
-            'can_moderate',$7 AND u.id<>$9 AND (NOT authority.wildcard OR '*'=ANY($10)),
-            'can_revoke_sessions',$8 AND authority.covered
+            'can_manage_roles',$6 AND authority.covered AND authority.target_rank<$11,
+            'can_moderate',$7 AND u.id<>$9 AND (NOT authority.wildcard OR '*'=ANY($10)) AND authority.target_rank<$11,
+            'can_revoke_sessions',$8 AND authority.covered AND (u.id=$9 OR authority.target_rank<$11)
         ) || CASE WHEN $3 THEN jsonb_build_object('email',u.email) ELSE '{}'::jsonb END
         FROM users u CROSS JOIN LATERAL (
             SELECT NOT EXISTS(
@@ -77,7 +83,9 @@ pub async fn users(
             ) covered, EXISTS(
                 SELECT 1 FROM roles r JOIN user_roles ur ON ur.role_id=r.id
                 WHERE ur.user_id=u.id AND '*'=ANY(r.permissions)
-            ) wildcard
+            ) wildcard, COALESCE((
+                SELECT max(r.rank) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id
+            ),0) target_rank
         ) authority
         WHERE ($4::text IS NULL OR ($5::bigint IS NOT NULL AND u.id=$5)
             OR ($5::bigint IS NULL AND strpos(lower(u.username),lower($4))>0))
@@ -93,6 +101,7 @@ pub async fn users(
         .bind(has_permission(&user.permissions, "users.sessions.revoke"))
         .bind(user.id)
         .bind(&user.permissions)
+        .bind(actor_rank)
         .fetch_all(&state.db)
         .await?;
     Ok(page(items, total, p, size))
@@ -128,6 +137,28 @@ async fn target_permissions(
     .await?)
 }
 
+/// Highest rank among a user's roles; users without roles rank 0.
+async fn rank_of(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: i64) -> ApiResult<i32> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(max(r.rank),0) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// Nobody may act on a user or role at or above their own rank.
+fn outranks(actor: i32, target: i32) -> ApiResult<()> {
+    if target >= actor {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "rank_too_low",
+            "You can only manage users and roles ranked below your own.".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn retain_administrator(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> ApiResult<()> {
     let admins:i64=sqlx::query_scalar("SELECT count(DISTINCT u.id) FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id WHERE NOT u.is_restricted AND '*'=ANY(r.permissions)").fetch_one(&mut **tx).await?;
     if admins == 0 {
@@ -144,7 +175,7 @@ fn builtin_role(id: i64, name: &str) -> bool {
     (1..=3).contains(&id)
         || matches!(
             name,
-            "player" | "moderator" | "administrator" | "beatmap_nominator"
+            "player" | "moderator" | "administrator" | "beatmap_nominator" | "super_user"
         )
 }
 #[derive(Deserialize)]
@@ -184,6 +215,8 @@ pub async fn update_user(
     if existing.iter().any(|permission| permission == "*") {
         can_delegate(&user.permissions, &["*".into()])?;
     }
+    let actor_rank = rank_of(&mut tx, user.id).await?;
+    let target_rank = rank_of(&mut tx, id).await?;
     if let Some(ref roles) = input.roles {
         // Removing a grant is privileged too: a limited manager must not be
         // able to strip a stronger operator's role by assigning weaker roles.
@@ -206,6 +239,13 @@ pub async fn update_user(
         .fetch_all(&mut *tx)
         .await?;
         can_delegate(&user.permissions, &delegated)?;
+        let highest: i32 =
+            sqlx::query_scalar("SELECT COALESCE(max(rank),0) FROM roles WHERE id=ANY($1)")
+                .bind(roles)
+                .fetch_one(&mut *tx)
+                .await?;
+        outranks(actor_rank, target_rank)?;
+        outranks(actor_rank, highest)?;
         sqlx::query("DELETE FROM user_roles WHERE user_id=$1")
             .bind(id)
             .execute(&mut *tx)
@@ -217,6 +257,7 @@ pub async fn update_user(
             .await?;
     }
     if let Some(restricted) = input.is_restricted {
+        outranks(actor_rank, target_rank)?;
         sqlx::query("UPDATE users SET is_restricted=$2 WHERE id=$1")
             .bind(id)
             .bind(restricted)
@@ -250,7 +291,7 @@ pub async fn roles(State(state): State<AppState>, headers: HeaderMap) -> ApiResu
     {
         return Err(ApiError::forbidden());
     }
-    let items = sqlx::query_scalar::<_, Value>("SELECT to_jsonb(r)||jsonb_build_object('membership_count',(SELECT count(*) FROM user_roles ur WHERE ur.role_id=r.id),'is_builtin',r.id BETWEEN 1 AND 3 OR r.name IN ('player','moderator','administrator')) FROM roles r ORDER BY id")
+    let items = sqlx::query_scalar::<_, Value>("SELECT to_jsonb(r)||jsonb_build_object('membership_count',(SELECT count(*) FROM user_roles ur WHERE ur.role_id=r.id),'is_builtin',r.id BETWEEN 1 AND 3 OR r.name IN ('player','moderator','administrator','super_user')) FROM roles r ORDER BY id")
         .fetch_all(&state.db)
         .await?;
     let total = items.len() as i64;
@@ -333,7 +374,11 @@ pub async fn create_role(
     let user = lock_actor(&mut tx, &user, None).await?;
     user.require("roles.manage")?;
     can_delegate(&user.permissions, &input.permissions)?;
-    let value:Value=sqlx::query_scalar("INSERT INTO roles(name,description,permissions,short_name,colour,display_badge) VALUES($1,$2,$3,$4,$5,$6) RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',0,'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator'))").bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).fetch_one(&mut *tx).await?;
+    // New roles rank just below their creator (at most 10) so the creator can still assign them.
+    let creator_rank = rank_of(&mut tx, user.id).await?;
+    outranks(creator_rank, 0)?;
+    let new_rank = (creator_rank - 1).min(10);
+    let value:Value=sqlx::query_scalar("INSERT INTO roles(name,description,permissions,short_name,colour,display_badge,rank) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',0,'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator','super_user'))").bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).bind(new_rank).fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'roles.create','role',$2,$3)").bind(user.id).bind(value["id"].to_string()).bind(json!({"name":input.name,"permissions":input.permissions})).execute(&mut *tx).await?;
     auth::ensure_mutation_actor(&mut tx, &user).await?;
     tx.commit().await?;
@@ -377,7 +422,12 @@ pub async fn update_role(
             "The administrator role must retain its name and full permission.".into(),
         ));
     }
-    let value:Value=sqlx::query_scalar("UPDATE roles SET name=$2,description=$3,permissions=$4,short_name=$5,colour=$6,display_badge=$7 WHERE id=$1 RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',(SELECT count(*) FROM user_roles ur WHERE ur.role_id=roles.id),'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator'))").bind(id).bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).fetch_one(&mut *tx).await?;
+    let role_rank: i32 = sqlx::query_scalar("SELECT rank FROM roles WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    outranks(rank_of(&mut tx, user.id).await?, role_rank)?;
+    let value:Value=sqlx::query_scalar("UPDATE roles SET name=$2,description=$3,permissions=$4,short_name=$5,colour=$6,display_badge=$7 WHERE id=$1 RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',(SELECT count(*) FROM user_roles ur WHERE ur.role_id=roles.id),'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator','super_user'))").bind(id).bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).fetch_one(&mut *tx).await?;
     retain_administrator(&mut tx).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'roles.update','role',$2,$3)").bind(user.id).bind(id.to_string()).bind(json!({"name":input.name,"permissions":input.permissions})).execute(&mut *tx).await?;
     auth::ensure_mutation_actor(&mut tx, &user).await?;
@@ -411,6 +461,10 @@ pub async fn delete_role(
     let existing: Vec<String> =
         serde_json::from_value(value["permissions"].clone()).map_err(ApiError::internal)?;
     can_delegate(&actor.permissions, &existing)?;
+    outranks(
+        rank_of(&mut tx, actor.id).await?,
+        value["rank"].as_i64().unwrap_or(0) as i32,
+    )?;
     let assigned: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_roles WHERE role_id=$1)")
             .bind(id)
@@ -447,6 +501,10 @@ pub async fn revoke_user_sessions(
     actor.require("users.sessions.revoke")?;
     let existing = target_permissions(&mut tx, id).await?;
     can_delegate(&actor.permissions, &existing)?;
+    if id != actor.id {
+        let actor_rank = rank_of(&mut tx, actor.id).await?;
+        outranks(actor_rank, rank_of(&mut tx, id).await?)?;
+    }
     let web = sqlx::query("DELETE FROM sessions WHERE user_id=$1")
         .bind(id)
         .execute(&mut *tx)

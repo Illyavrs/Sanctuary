@@ -797,6 +797,7 @@ pub async fn bootstrap(state: &AppState) -> ApiResult<()> {
             .bind(&username)
             .fetch_optional(&state.db)
             .await?;
+    let created = existing.is_none();
     let id = if let Some(row) = existing {
         if !verify(password, row.get("password_hash")).await {
             return Err(ApiError::bad(
@@ -809,6 +810,10 @@ pub async fn bootstrap(state: &AppState) -> ApiResult<()> {
         sqlx::query_scalar("INSERT INTO users(username,email,password_hash,password_md5_hash) VALUES($1,$2,$3,$4) RETURNING id").bind(username).bind(email.to_lowercase()).bind(hash).bind(legacy).fetch_one(&state.db).await?
     };
     sqlx::query("INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE name IN ('administrator','player') ON CONFLICT DO NOTHING").bind(id).execute(&state.db).await?;
+    // The account that first sets up a server owns it; later transfers go through the CLI.
+    if created {
+        sqlx::query("INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE name='super_user' AND NOT EXISTS(SELECT 1 FROM user_roles ur WHERE ur.role_id=roles.id)").bind(id).execute(&state.db).await?;
+    }
     Ok(())
 }
 

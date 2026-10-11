@@ -67,6 +67,7 @@ mod server_catalogue;
 #[cfg(test)]
 mod server_catalogue_tests;
 mod social;
+mod super_user;
 mod website_chat;
 mod website_chat_runtime;
 
@@ -711,6 +712,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "sanctuary=info,tower_http=info".into()),
         )
         .init();
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
+        Some("grant-super-user") => return super_user::run(&args[1..]).await,
+        Some(other) => {
+            return Err(
+                format!("unknown command {other}; supported: grant-super-user <user_id>").into(),
+            );
+        }
+        None => {}
+    }
     let secret = env::var("SESSION_SECRET").map_err(|_| "SESSION_SECRET must be configured")?;
     if secret.len() < 32 {
         return Err("SESSION_SECRET must contain at least 32 bytes".into());

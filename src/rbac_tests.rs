@@ -254,19 +254,21 @@ async fn scoped_rbac_privacy_deletion_revocation_and_queued_authorization() {
         assert_eq!(value["error"]["code"], "role_assigned");
         assert!(value["error"]["message"].as_str().unwrap().contains("Unassign"));
         let unused = role(&pool, "unused_role", &["chat.send"]).await;
+        sqlx::query("UPDATE roles SET rank=0 WHERE id=$1").bind(unused).execute(&pool).await.unwrap();
         let before = audit_count(&pool).await;
         assert_eq!(request(&app, Method::DELETE, &format!("/api/v1/admin/roles/{unused}"), &manager_cookie, None).await.0, StatusCode::OK);
         assert_eq!(audit_count(&pool).await, before + 1);
         let deletion: Value = sqlx::query_scalar("SELECT details FROM audit_events WHERE action='roles.delete' AND target_id=$1").bind(unused.to_string()).fetch_one(&pool).await.unwrap();
         assert_eq!(deletion["name"], "unused_role");
 
-        // Last unrestricted wildcard holder cannot remove their own final grant.
+        // Self-demotion is refused by the rank rule before the last-administrator guard is reached.
         let (code, denied) = request(&app, Method::PATCH, &format!("/api/v1/admin/users/{admin}"), &admin_cookie, Some(json!({"roles":[1]}))).await;
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-        assert_eq!(denied["error"]["code"], "last_administrator");
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(denied["error"]["code"], "rank_too_low");
+        // A holder cannot edit the role that gives them their own rank, so the guard is reached no other way.
         let wildcard = role(&pool, "custom_wildcard", &["*"]).await;
         sqlx::query("UPDATE user_roles SET role_id=$2 WHERE user_id=$1").bind(admin).bind(wildcard).execute(&pool).await.unwrap();
-        assert_eq!(request(&app, Method::PATCH, &format!("/api/v1/admin/roles/{wildcard}"), &admin_cookie, Some(json!({"name":"custom_wildcard","description":"","permissions":[]}))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app, Method::PATCH, &format!("/api/v1/admin/roles/{wildcard}"), &admin_cookie, Some(json!({"name":"custom_wildcard","description":"","permissions":[]}))).await.0, StatusCode::FORBIDDEN);
         sqlx::query("UPDATE user_roles SET role_id=3 WHERE user_id=$1").bind(admin).execute(&pool).await.unwrap();
 
         // Independent session revocation removes all web, stable and lazer auth records without restricting the account.
