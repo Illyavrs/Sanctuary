@@ -739,13 +739,12 @@ async fn record_play_seconds(
     reported: Option<i32>,
 ) -> ApiResult<()> {
     sqlx::query(
-        "UPDATE scores s SET play_seconds=GREATEST(0,LEAST(c.cap,COALESCE($2::int,
-             CASE WHEN s.client='lazer' THEN EXTRACT(EPOCH FROM (now()-t.created_at))::int END,
-             CASE WHEN s.passed THEN c.cap END)))
-         FROM beatmaps b
-         CROSS JOIN LATERAL (SELECT CEIL(b.length_seconds/CASE WHEN s.mods&(64|512)<>0 THEN 1.5 WHEN s.mods&256<>0 THEN 0.75 ELSE 1 END)::int AS cap) c
-         LEFT JOIN lazer_score_tokens t ON s.ingestion_key LIKE 'lazer:%' AND t.id=NULLIF(split_part(s.ingestion_key,':',2),'')::bigint
-         WHERE s.id=$1 AND b.id=s.beatmap_id AND s.play_seconds IS NULL",
+        "UPDATE scores s SET play_seconds=(
+             SELECT GREATEST(0,LEAST(c.cap,COALESCE($2::int,
+                 CASE WHEN s.client='lazer' THEN (SELECT EXTRACT(EPOCH FROM (now()-t.created_at))::int FROM lazer_score_tokens t WHERE s.ingestion_key LIKE 'lazer:%' AND t.id=NULLIF(split_part(s.ingestion_key,':',2),'')::bigint) END,
+                 CASE WHEN s.passed THEN c.cap END)))
+             FROM (SELECT CEIL(b.length_seconds/CASE WHEN s.mods&(64|512)<>0 THEN 1.5 WHEN s.mods&256<>0 THEN 0.75 ELSE 1 END)::int AS cap FROM beatmaps b WHERE b.id=s.beatmap_id) c)
+         WHERE s.id=$1 AND s.play_seconds IS NULL",
     )
     .bind(score_id)
     .bind(reported.filter(|seconds| (0..=36_000).contains(seconds)))
