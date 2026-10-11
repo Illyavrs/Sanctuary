@@ -313,6 +313,33 @@ pub async fn update_user(
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaffRename {
+    username: String,
+}
+/// Staff rename: no password or cooldown, but only players the actor outranks (or themselves).
+pub async fn rename_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<StaffRename>,
+) -> ApiResult {
+    let user = auth::require(&state, &headers).await?;
+    user.require("users.moderate")?;
+    let mut tx = state.db.begin().await?;
+    let user = lock_actor(&mut tx, &user, Some(id)).await?;
+    user.require("users.moderate")?;
+    if id != user.id {
+        let actor_rank = rank_of(&mut tx, user.id).await?;
+        let target_rank = rank_of(&mut tx, id).await?;
+        outranks(actor_rank, target_rank)?;
+    }
+    auth::rename_user_in_tx(&mut tx, id, &input.username, user.id, false).await?;
+    auth::ensure_mutation_actor(&mut tx, &user).await?;
+    tx.commit().await?;
+    Ok(Json(json!({"ok":true})))
+}
 pub async fn roles(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     let user = auth::require(&state, &headers).await?;
     if !has_permission(&user.permissions, "admin.view")

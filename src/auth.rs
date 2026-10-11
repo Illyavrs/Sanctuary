@@ -332,6 +332,7 @@ pub async fn register(
     preferences.validate().map_err(ApiError::bad)?;
     let (hash, legacy) = hash_password(input.password).await?;
     let mut tx = state.db.begin().await?;
+    ensure_username_available(&mut tx, &input.username, None).await?;
     let id:i64=sqlx::query_scalar("INSERT INTO users(username,email,password_hash,password_md5_hash,preferences) VALUES($1,$2,$3,$4,$5) RETURNING id").bind(input.username).bind(email).bind(&hash).bind(legacy).bind(json!(preferences)).fetch_one(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE name='player'",
@@ -852,6 +853,146 @@ pub async fn bootstrap(state: &AppState) -> ApiResult<()> {
         sqlx::query("INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE name='super_user' AND NOT EXISTS(SELECT 1 FROM user_roles ur WHERE ur.role_id=roles.id)").bind(id).execute(&state.db).await?;
     }
     Ok(())
+}
+
+/// A player may rename once per this many days; staff renames do not use the allowance.
+const USERNAME_COOLDOWN_DAYS: i64 = 30;
+/// A released name stays reserved for its previous owner this long.
+const USERNAME_RESERVED_DAYS: i64 = 90;
+
+/// Reject a name another account holds, or recently released and still reserved for someone else.
+pub(crate) async fn ensure_username_available(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    name: &str,
+    for_user: Option<i64>,
+) -> ApiResult<()> {
+    let taken: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE lower(username)=lower($1) AND id IS DISTINCT FROM $2)",
+    )
+    .bind(name)
+    .bind(for_user)
+    .fetch_one(&mut **tx)
+    .await?;
+    if taken {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "username_taken",
+            "That username is already taken.".into(),
+        ));
+    }
+    let reserved: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM username_history WHERE lower(old_username)=lower($1) AND user_id IS DISTINCT FROM $2 AND changed_at>now()-make_interval(days=>$3::int))",
+    )
+    .bind(name)
+    .bind(for_user)
+    .bind(USERNAME_RESERVED_DAYS as i32)
+    .fetch_one(&mut **tx)
+    .await?;
+    if reserved {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "username_reserved",
+            "That username was recently released and is reserved for its previous owner.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Rename inside the caller's transaction. Stable sessions are closed so connected clients sign in
+/// again and show the new name; scores, chat and relationships follow the account id.
+pub(crate) async fn rename_user_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: i64,
+    new_name: &str,
+    actor: i64,
+    enforce_cooldown: bool,
+) -> ApiResult<()> {
+    validate_username(new_name).map_err(ApiError::bad)?;
+    let row = sqlx::query("SELECT username,username_changed_at,username_changed_at>now()-make_interval(days=>$2::int) AS cooling FROM users WHERE id=$1 FOR UPDATE")
+        .bind(target)
+        .bind(USERNAME_COOLDOWN_DAYS as i32)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(ApiError::missing)?;
+    let old: String = row.get("username");
+    if old == new_name {
+        return Err(ApiError::bad("Choose a different username."));
+    }
+    if enforce_cooldown && row.get::<Option<bool>, _>("cooling").unwrap_or(false) {
+        let until: chrono::DateTime<Utc> = row
+            .get::<chrono::DateTime<Utc>, _>("username_changed_at")
+            + chrono::Duration::days(USERNAME_COOLDOWN_DAYS);
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "username_cooldown",
+            format!(
+                "You can change your username again on {}.",
+                until.format("%Y-%m-%d")
+            ),
+        ));
+    }
+    ensure_username_available(tx, new_name, Some(target)).await?;
+    sqlx::query(
+        "UPDATE users SET username=$2,username_changed_at=CASE WHEN $3 THEN now() ELSE username_changed_at END WHERE id=$1",
+    )
+    .bind(target)
+    .bind(new_name)
+    .bind(enforce_cooldown)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("INSERT INTO username_history(user_id,old_username,new_username,changed_by) VALUES($1,$2,$3,$4)")
+        .bind(target)
+        .bind(&old)
+        .bind(new_name)
+        .bind(actor)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM bancho_sessions WHERE user_id=$1")
+        .bind(target)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'users.rename','user',$2,$3)")
+        .bind(actor)
+        .bind(target.to_string())
+        .bind(json!({"old":old,"new":new_name,"staff":actor!=target}))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsernameChange {
+    username: String,
+    current_password: String,
+}
+pub async fn change_username(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<UsernameChange>,
+) -> ApiResult {
+    let user = require(&state, &headers).await?;
+    validate_username(&input.username).map_err(ApiError::bad)?;
+    if input.current_password.len() > 128 {
+        return Err(ApiError::unauthorized());
+    }
+    let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id=$1")
+        .bind(user.id)
+        .fetch_one(&state.db)
+        .await?;
+    if !verify(input.current_password, hash).await {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid_password",
+            "The current password is incorrect.".into(),
+        ));
+    }
+    let mut tx = state.db.begin().await?;
+    let user = mutation_actor(&mut tx, &user, &[], MutationScope::Session).await?;
+    rename_user_in_tx(&mut tx, user.id, &input.username, user.id, true).await?;
+    ensure_mutation_actor(&mut tx, &user).await?;
+    tx.commit().await?;
+    Ok(Json(profile(&state, user.id, true).await?))
 }
 
 #[cfg(test)]

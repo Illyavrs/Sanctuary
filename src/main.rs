@@ -428,6 +428,7 @@ fn router(state: AppState) -> Router {
             "/api/v1/me/sessions/revoke-others",
             post(account_sessions::revoke_others),
         )
+        .route("/api/v1/me/username", post(auth::change_username))
         .route("/api/v1/me/relationships", get(social::list))
         .route("/api/v1/users/online", get(social::online))
         .route(
@@ -634,6 +635,10 @@ fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(256 * 1024)),
         )
         .route("/api/v1/admin/users/{id}", patch(admin::update_user))
+        .route(
+            "/api/v1/admin/users/{id}/username",
+            post(admin::rename_user),
+        )
         .route(
             "/api/v1/admin/users/{id}/sessions/revoke",
             post(admin::revoke_user_sessions),
