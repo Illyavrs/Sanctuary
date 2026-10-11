@@ -223,9 +223,9 @@ pub(crate) async fn profile_in_variant(
         serde_json::from_value(row.get::<Value, _>("preferences")).unwrap_or_default();
     let mut value = json!({"id":id,"username":row.get::<String,_>("username"),"country":row.get::<String,_>("country"),"bio":row.get::<String,_>("bio"),"avatar_url":row.get::<Option<String>,_>("avatar_url"),"banner_url":row.get::<Option<String>,_>("banner_url"),"accent_color":row.get::<String,_>("accent_color"),"banner_position_x":row.get::<i32,_>("banner_position_x"),"banner_position_y":row.get::<i32,_>("banner_position_y"),"roles":roles,"joined_at":row.get::<chrono::DateTime<Utc>,_>("joined_at"),"pp":stats["pp"],"play_count":stats["play_count"],"accuracy":stats["accuracy"],"statistics":stats});
     // Only roles flagged as badges are public; the rest stay permission plumbing.
-    let groups = sqlx::query("SELECT r.id,r.name,r.short_name,r.colour FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 AND r.display_badge ORDER BY r.id")
+    let groups = sqlx::query("SELECT r.id,r.name,r.short_name,r.colour,r.icon FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 AND r.display_badge ORDER BY r.rank DESC,r.id")
         .bind(id).fetch_all(&state.db).await?;
-    value["groups"] = json!(groups.into_iter().map(|g| json!({"id":g.get::<i64,_>("id"),"name":g.get::<String,_>("name"),"short_name":g.get::<String,_>("short_name"),"colour":g.get::<Option<String>,_>("colour")})).collect::<Vec<_>>());
+    value["groups"] = json!(groups.into_iter().map(|g| json!({"id":g.get::<i64,_>("id"),"name":g.get::<String,_>("name"),"short_name":g.get::<String,_>("short_name"),"colour":g.get::<Option<String>,_>("colour"),"icon":g.get::<Option<String>,_>("icon")})).collect::<Vec<_>>());
     if private {
         value["email"] = json!(row.get::<String, _>("email"));
         value["email_verified"] = json!(

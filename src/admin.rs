@@ -300,13 +300,12 @@ pub async fn roles(State(state): State<AppState>, headers: HeaderMap) -> ApiResu
 /// Public staff directory: every role that shows a badge, highest rank first, listing its
 /// unrestricted members once under their highest displayed group.
 pub async fn public_groups(State(state): State<AppState>) -> ApiResult {
-    let items = sqlx::query_scalar::<_, Value>(
+    let items = sqlx::query_scalar::<_, Value>(&format!(
         "SELECT COALESCE(jsonb_agg(g ORDER BY (g->>'rank')::int DESC,(g->>'id')::bigint),'[]'::jsonb) FROM (
-            SELECT jsonb_build_object('id',r.id,'name',r.name,'description',r.description,'description_i18n',r.description_i18n,
+            SELECT jsonb_build_object('id',r.id,'name',r.name,'description',r.description,'description_i18n',r.description_i18n,'icon',r.icon,
                 'short_name',r.short_name,'colour',r.colour,'rank',r.rank,
                 'members',COALESCE((
-                    SELECT jsonb_agg(jsonb_build_object('id',u.id,'username',u.username,
-                        'country',u.country,'avatar_url',u.avatar_url) ORDER BY lower(u.username))
+                    SELECT jsonb_agg(({card}) - 'groups' ORDER BY lower(u.username))
                     FROM user_roles ur JOIN users u ON u.id=ur.user_id
                     WHERE ur.role_id=r.id AND NOT u.is_restricted
                         AND r.rank=(SELECT max(r2.rank) FROM roles r2 JOIN user_roles ur2 ON ur2.role_id=r2.id
@@ -314,7 +313,8 @@ pub async fn public_groups(State(state): State<AppState>) -> ApiResult {
                 ),'[]'::jsonb)) g
             FROM roles r WHERE r.display_badge
         ) groups",
-    )
+        card = crate::social::CARD
+    ))
     .fetch_one(&state.db)
     .await?;
     Ok(Json(json!({ "items": items })))
@@ -333,10 +333,40 @@ pub struct RoleInput {
     colour: Option<String>,
     #[serde(default)]
     display_badge: bool,
+    /// Badge icon key from `ROLE_ICONS`; absent keeps the default for the role.
+    #[serde(default)]
+    icon: Option<String>,
     /// Introductions per locale (`zh-TW`, `en`, `ja`); `description` is the fallback.
     #[serde(default)]
     description_i18n: std::collections::BTreeMap<String, String>,
 }
+/// Icon keys the website knows how to draw; keep in sync with `role-badge.tsx`.
+const ROLE_ICONS: &[&str] = &[
+    "crown",
+    "shield-check",
+    "shield",
+    "music",
+    "tag",
+    "star",
+    "heart",
+    "flame",
+    "gem",
+    "zap",
+    "sparkles",
+    "trophy",
+    "wrench",
+    "headphones",
+    "brush",
+    "code",
+    "flag",
+    "bug",
+    "megaphone",
+    "user-check",
+    "award",
+    "swords",
+    "rocket",
+    "leaf",
+];
 fn i18n_json(input: &RoleInput) -> Value {
     // Blank entries mean "use the fallback", so they are not stored.
     Value::Object(
@@ -366,6 +396,11 @@ fn validate_role(input: &RoleInput) -> ApiResult<()> {
         return Err(ApiError::bad(
             "Group introductions are at most 500 characters.",
         ));
+    }
+    if let Some(icon) = &input.icon
+        && !ROLE_ICONS.contains(&icon.as_str())
+    {
+        return Err(ApiError::bad("Unknown badge icon."));
     }
     let short = input.short_name.trim();
     if short.chars().count() > 8 || short.chars().any(char::is_control) {
@@ -421,7 +456,7 @@ pub async fn create_role(
     let creator_rank = rank_of(&mut tx, user.id).await?;
     outranks(creator_rank, 0)?;
     let new_rank = (creator_rank - 1).min(10);
-    let value:Value=sqlx::query_scalar("INSERT INTO roles(name,description,permissions,short_name,colour,display_badge,rank,description_i18n) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',0,'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator','super_user'))").bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).bind(new_rank).bind(i18n_json(&input)).fetch_one(&mut *tx).await?;
+    let value:Value=sqlx::query_scalar("INSERT INTO roles(name,description,permissions,short_name,colour,display_badge,rank,description_i18n,icon) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',0,'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator','super_user'))").bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).bind(new_rank).bind(i18n_json(&input)).bind(&input.icon).fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'roles.create','role',$2,$3)").bind(user.id).bind(value["id"].to_string()).bind(json!({"name":input.name,"permissions":input.permissions})).execute(&mut *tx).await?;
     auth::ensure_mutation_actor(&mut tx, &user).await?;
     tx.commit().await?;
@@ -470,7 +505,7 @@ pub async fn update_role(
         .fetch_one(&mut *tx)
         .await?;
     outranks(rank_of(&mut tx, user.id).await?, role_rank)?;
-    let value:Value=sqlx::query_scalar("UPDATE roles SET name=$2,description=$3,permissions=$4,short_name=$5,colour=$6,display_badge=$7,description_i18n=$8 WHERE id=$1 RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',(SELECT count(*) FROM user_roles ur WHERE ur.role_id=roles.id),'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator','super_user'))").bind(id).bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).bind(i18n_json(&input)).fetch_one(&mut *tx).await?;
+    let value:Value=sqlx::query_scalar("UPDATE roles SET name=$2,description=$3,permissions=$4,short_name=$5,colour=$6,display_badge=$7,description_i18n=$8,icon=$9 WHERE id=$1 RETURNING to_jsonb(roles)||jsonb_build_object('membership_count',(SELECT count(*) FROM user_roles ur WHERE ur.role_id=roles.id),'is_builtin',id BETWEEN 1 AND 3 OR name IN ('player','moderator','administrator','super_user'))").bind(id).bind(&input.name).bind(&input.description).bind(&input.permissions).bind(input.short_name.trim()).bind(input.colour.as_ref().map(|c| c.to_ascii_lowercase())).bind(input.display_badge).bind(i18n_json(&input)).bind(&input.icon).fetch_one(&mut *tx).await?;
     retain_administrator(&mut tx).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'roles.update','role',$2,$3)").bind(user.id).bind(id.to_string()).bind(json!({"name":input.name,"permissions":input.permissions})).execute(&mut *tx).await?;
     auth::ensure_mutation_actor(&mut tx, &user).await?;

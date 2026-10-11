@@ -29,7 +29,7 @@ pub struct Change {
 
 /// Player-card JSON shared by the friends list and the online list: identity, banner and
 /// the highest-ranked badge group, plus whether a game client is connected right now.
-const CARD: &str = "jsonb_build_object('id',u.id,'username',u.username,'avatar_url',u.avatar_url,'country',u.country,'banner_url',u.banner_url,'banner_position_x',u.banner_position_x,'banner_position_y',u.banner_position_y,'accent_color',u.accent_color,'online',EXISTS(SELECT 1 FROM bancho_sessions b WHERE b.user_id=u.id AND b.expires_at>now()) OR EXISTS(SELECT 1 FROM lazer_sessions l WHERE l.user_id=u.id AND l.access_expires_at>now() AND l.last_seen_at>now()-interval '3 minutes'),'groups',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name,'short_name',r.short_name,'colour',r.colour) ORDER BY r.rank DESC,r.id) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id AND r.display_badge),'[]'::jsonb))";
+pub const CARD: &str = "jsonb_build_object('id',u.id,'username',u.username,'avatar_url',u.avatar_url,'country',u.country,'banner_url',u.banner_url,'banner_position_x',u.banner_position_x,'banner_position_y',u.banner_position_y,'accent_color',u.accent_color,'online',EXISTS(SELECT 1 FROM bancho_sessions b WHERE b.user_id=u.id AND b.expires_at>now()) OR EXISTS(SELECT 1 FROM lazer_sessions l WHERE l.user_id=u.id AND l.access_expires_at>now() AND l.last_seen_at>now()-interval '3 minutes'),'groups',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name,'short_name',r.short_name,'colour',r.colour,'icon',r.icon) ORDER BY r.rank DESC,r.id) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id AND r.display_badge),'[]'::jsonb))";
 
 #[derive(Deserialize)]
 pub struct OnlineQuery {
