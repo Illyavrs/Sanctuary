@@ -252,6 +252,7 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
         if path.starts_with("/api/v1/auth/recovery/") || path.starts_with("/api/v1/auth/email/") {
             Some((5, 60, "recovery"))
         } else if path.starts_with("/api/v1/official/beatmapsets/")
+            || path.starts_with("/api/v1/official/beatmaps/")
             || path == "/api/v1/server/beatmapsets"
         {
             Some((30, 60, "official_discovery"))
@@ -480,6 +481,13 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v1/official/beatmapsets/{id}",
             get(maps::official_detail).layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            )),
+        )
+        .route(
+            "/api/v1/official/beatmaps/{id}/resolve",
+            get(maps::resolve_difficulty).layer(SetResponseHeaderLayer::overriding(
                 header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("no-store"),
             )),
