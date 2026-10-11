@@ -90,6 +90,23 @@ impl MailConfig {
         Self::from_values(origin, |key| std::env::var(key).unwrap_or_default())
     }
     fn from_values(origin: &str, get: impl Fn(&str) -> String) -> Result<Self, MailError> {
+        // `RESEND_API_KEY` is shorthand for Resend's SMTP relay (implicit TLS, user `resend`, the API
+        // key as password). An explicit `SMTP_HOST` wins, so other providers are unaffected.
+        let resend_key = Zeroizing::new(get("RESEND_API_KEY"));
+        let use_resend = !resend_key.is_empty() && get("SMTP_HOST").is_empty();
+        let get = |key: &str| -> String {
+            if use_resend {
+                match key {
+                    "SMTP_HOST" => return "smtp.resend.com".into(),
+                    "SMTP_PORT" => return "465".into(),
+                    "SMTP_TLS" => return "implicit".into(),
+                    "SMTP_USERNAME" => return "resend".into(),
+                    "SMTP_PASSWORD" => return resend_key.to_string(),
+                    _ => {}
+                }
+            }
+            get(key)
+        };
         let host = get("SMTP_HOST");
         let from = get("SMTP_FROM");
         let username = get("SMTP_USERNAME");
@@ -636,6 +653,19 @@ mod tests {
             config("https://illya.test", &values(&[("SMTP_TLS", "implicit")]))
                 .unwrap()
                 .is_enabled()
+        );
+        // Resend shorthand: only the API key and sender are needed.
+        let resend = HashMap::from([
+            ("RESEND_API_KEY".into(), "re_fixture_key".into()),
+            ("SMTP_FROM".into(), "noreply@illya.test".into()),
+            ("MAIL_ENCRYPTION_KEY".into(), "11".repeat(32)),
+        ]);
+        assert!(config("https://illya.test", &resend).unwrap().is_enabled());
+        let mut missing_sender = resend.clone();
+        missing_sender.remove("SMTP_FROM");
+        assert_eq!(
+            config("https://illya.test", &missing_sender).unwrap_err().0,
+            "mail_configuration_incomplete"
         );
     }
 
