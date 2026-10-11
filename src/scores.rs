@@ -311,13 +311,30 @@ pub(crate) async fn statistics(
     let pp = stats.get::<f64, _>("pp");
     let plays = stats.get::<i64, _>("play_count");
     let totals_available = variant == ScoreVariant::Vanilla;
+    // Opt-in Bancho comparison: rank the pp against official players. Relax is exempt, and the
+    // server-local country rank is hidden because it would contradict the estimate.
+    let bancho_estimate: Option<i64> = if pp > 0.0 && variant == ScoreVariant::Vanilla {
+        sqlx::query_scalar("SELECT bancho_rank_estimate($2::smallint,$3) FROM users WHERE id=$1 AND COALESCE(preferences->>'bancho_rank','false')='true'")
+            .bind(user_id)
+            .bind(mode)
+            .bind(pp)
+            .fetch_optional(&state.db)
+            .await?
+    } else {
+        None
+    };
     let rank = if pp > 0.0 {
-        Some(stats.get::<i64, _>("rank"))
+        Some(bancho_estimate.unwrap_or_else(|| stats.get::<i64, _>("rank")))
+    } else {
+        None
+    };
+    let country_rank = if pp > 0.0 && bancho_estimate.is_none() {
+        Some(stats.get::<i64, _>("country_rank"))
     } else {
         None
     };
     Ok(
-        json!({"mode":mode,"score_variant":variant,"pp":pp,"rank":rank,"global_rank":rank,"country_rank":if pp>0.0{Some(stats.get::<i64,_>("country_rank"))}else{None},"play_count":plays,"accuracy":stats.get::<f64,_>("accuracy"),"maximum_combo":stats.get::<i32,_>("maximum_combo"),"total_hits":stats.get::<i64,_>("total_hits"),"total_score":if totals_available{Some(stats.get::<i64,_>("total_score"))}else{None},"ranked_score":if totals_available{Some(stats.get::<i64,_>("ranked_score"))}else{None},"score_totals_complete":totals_available&&plays==stats.get::<i64,_>("scaled_plays"),"score_scale":if totals_available{"classic_display"}else{"unavailable_for_relax"},"grade_counts":grades}),
+        json!({"mode":mode,"score_variant":variant,"pp":pp,"rank":rank,"global_rank":rank,"country_rank":country_rank,"bancho_rank":bancho_estimate.is_some(),"play_count":plays,"accuracy":stats.get::<f64,_>("accuracy"),"maximum_combo":stats.get::<i32,_>("maximum_combo"),"total_hits":stats.get::<i64,_>("total_hits"),"total_score":if totals_available{Some(stats.get::<i64,_>("total_score"))}else{None},"ranked_score":if totals_available{Some(stats.get::<i64,_>("ranked_score"))}else{None},"score_totals_complete":totals_available&&plays==stats.get::<i64,_>("scaled_plays"),"score_scale":if totals_available{"classic_display"}else{"unavailable_for_relax"},"grade_counts":grades}),
     )
 }
 
