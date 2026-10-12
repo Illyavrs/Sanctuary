@@ -614,6 +614,10 @@ pub struct ParsedMap {
     pub md5: String,
     pub official_id: Option<i64>,
     pub official_set_id: Option<i64>,
+    // A legacy file may omit IDs; present but malformed IDs must still fail
+    // official identity binding rather than being treated as absent.
+    official_id_present: bool,
+    official_set_id_present: bool,
 }
 pub fn parse_map(bytes: Vec<u8>) -> ApiResult<ParsedMap> {
     if bytes.is_empty() || bytes.len() > 8 * 1024 * 1024 {
@@ -702,6 +706,8 @@ pub fn parse_map(bytes: Vec<u8>) -> ApiResult<ParsedMap> {
         length: (last_time / 1000.0) as i32,
         max_combo: attrs.max_combo().min(i32::MAX as u32) as i32,
         md5: format!("{:x}", md5::compute(&bytes)),
+        official_id_present: fields.contains_key("BeatmapID"),
+        official_set_id_present: fields.contains_key("BeatmapSetID"),
         official_id: fields.get("BeatmapID").and_then(|value| value.parse().ok()),
         official_set_id: fields
             .get("BeatmapSetID")
@@ -1664,9 +1670,12 @@ async fn fetch_official_map(state: &AppState, selector: &MapSelector) -> ApiResu
             "Official metadata and beatmap checksum did not match.",
         ));
     }
+    // Older official files omit these metadata keys. The authenticated API and
+    // exact original-byte checksum above bind their canonical IDs. Preserve
+    // strict agreement for every identity key the file actually supplies.
     if i64::from(map.mode) != mode
-        || map.official_id != Some(id)
-        || map.official_set_id != Some(set_id)
+        || (map.official_id_present && map.official_id != Some(id))
+        || (map.official_set_id_present && map.official_set_id != Some(set_id))
     {
         return Err(invalid_identity());
     }

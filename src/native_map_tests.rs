@@ -568,7 +568,7 @@ async fn reset_official(state: &AppState, server: &OfficialServer, configured: b
 async fn wait_for_queued_resolution(db: &PgPool, application: &str) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let queued: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND state='idle' AND query LIKE '%jsonb_build_object(''id'',id%')")
+            let queued: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND state='idle' AND query LIKE '%jsonb_build_object(''id'',b.id%')")
                 .bind(application).fetch_one(db).await.unwrap();
             if queued {
                 break;
@@ -1011,12 +1011,43 @@ async fn native_map_resolution_imports_cache_and_integrity() {
             "a caller retry after Retry-After expires must import using the cached OAuth token"
         );
 
+        // Pre-ID official files keep their exact bytes and checksum. Bind the
+        // absent keys to authenticated API metadata, including partial omission.
+        for (id, omit_map, omit_set) in [(120, true, true), (121, true, false), (122, false, true)] {
+            let app = reset_official(&state, &server, true).await;
+            let mut map = OfficialMap::new(id, "ranked");
+            let mut text = String::from_utf8(map.bytes).unwrap();
+            if omit_map { text = text.replace(&format!("BeatmapID:{id}\n"), ""); }
+            if omit_set { text = text.replace(&format!("BeatmapSetID:{}\n", id+1000), ""); }
+            map.bytes = text.into_bytes();
+            let original = map.bytes.clone();
+            let checksum = format!("{:x}", md5::compute(&original));
+            map.metadata["checksum"] = json!(checksum);
+            server.add(map).await;
+            let (status, value) = resolve(&app, json!({"user_id":user,"checksum":checksum})).await;
+            assert_eq!(status, StatusCode::OK, "legacy {id}: {value}");
+            assert_resolved(&pool, &value, &checksum, Some(id), "ranked", "official").await;
+            assert_eq!(value["official_set_id"], id+1000);
+            let path: String = sqlx::query_scalar("SELECT osu_path FROM beatmaps WHERE id=$1").bind(value["id"].as_i64().unwrap()).fetch_one(&pool).await.unwrap();
+            assert_eq!(tokio::fs::read(state.maps_root.join(path)).await.unwrap(), original);
+            let before = server.counters();
+            let (status, cached) = resolve(&app, json!({"user_id":user,"official_id":id})).await;
+            assert_eq!(status, StatusCode::OK); assert_eq!(cached, value);
+            assert_eq!(server.counters(), before, "legacy map must resolve from stored canonical identity");
+        }
+
         // API/file checksum, mode, and identities must agree before persistence.
         for (id, defect, expected_code) in [
             (105, "checksum", "checksum_mismatch"),
             (106, "mode", "official_identity_mismatch"),
             (107, "file_id", "official_identity_mismatch"),
             (108, "file_set", "official_identity_mismatch"),
+            (123, "missing_checksum", "checksum_mismatch"),
+            (124, "missing_mode", "official_identity_mismatch"),
+            (125, "malformed_id", "official_identity_mismatch"),
+            (126, "malformed_set", "official_identity_mismatch"),
+            (127, "empty_id", "official_identity_mismatch"),
+            (128, "zero_id", "official_identity_mismatch"),
         ] {
             let app = reset_official(&state, &server, true).await;
             let mut map = OfficialMap::new(id, "ranked");
@@ -1030,6 +1061,20 @@ async fn native_map_resolution_imports_cache_and_integrity() {
                 "file_set" => {
                     map.bytes = osu_bytes(id, id + 1099, 0, "Wrong file set");
                     map.metadata["checksum"] = json!(format!("{:x}", md5::compute(&map.bytes)));
+                }
+                "missing_checksum" | "missing_mode" | "malformed_id" | "malformed_set" | "empty_id" | "zero_id" => {
+                    let mut text = String::from_utf8(map.bytes).unwrap();
+                    if defect.starts_with("missing_") {
+                        text = text.replace(&format!("BeatmapID:{id}\n"), "").replace(&format!("BeatmapSetID:{}\n",id+1000), "");
+                    } else if defect == "malformed_set" {
+                        text = text.replace(&format!("BeatmapSetID:{}",id+1000),"BeatmapSetID:invalid");
+                    } else {
+                        let value = match defect { "malformed_id" => "invalid", "empty_id" => "", _ => "0" };
+                        text = text.replace(&format!("BeatmapID:{id}"), &format!("BeatmapID:{value}"));
+                    }
+                    map.bytes = text.into_bytes();
+                    map.metadata["checksum"] = json!(if defect == "missing_checksum" { "4".repeat(32) } else { format!("{:x}",md5::compute(&map.bytes)) });
+                    if defect == "missing_mode" { map.metadata["mode_int"] = json!(1); }
                 }
                 _ => unreachable!(),
             }
