@@ -61,6 +61,7 @@ mod rbac_tests;
 mod relax_tests;
 mod score_recalculation;
 mod score_recovery;
+mod score_resubmission;
 mod score_scales;
 mod scores;
 mod server_catalogue;
@@ -537,6 +538,10 @@ fn router(state: AppState) -> Router {
             get(scores::list)
                 .post(scores::submit)
                 .layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/api/v1/scores/resubmit",
+            post(score_resubmission::submit).layer(DefaultBodyLimit::max(18 * 1024 * 1024)),
         )
         .route(
             "/api/v1/scores/{id}/replay",
