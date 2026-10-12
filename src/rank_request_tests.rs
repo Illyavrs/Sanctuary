@@ -250,7 +250,7 @@ async fn rank_request_http_guards_and_owner_lists_do_not_expose_other_players() 
             json!({"native_set_id":set,"official_set_id":42,"reason":"Review"}),
             json!({"official_set_id":set,"reason":"Review"}),
             json!({"native_set_id":set,"reason":" "}),
-            json!({"native_set_id":set,"reason":"unsafe\nreason"}),
+            json!({"native_set_id":set,"reason":"unsafe\0reason"}),
             json!({"native_set_id":set,"reason":"x".repeat(1001)}),
             json!({"native_set_id":set,"reason":"Review","status":"approved"}),
         ] {
@@ -571,7 +571,7 @@ async fn approval_requires_moderation_and_ranks_only_selected_difficulties() {
             &format!("{QUEUE}/{id}"),
             Some(&staff),
             json!({
-                "decision":"approved","reason":"unsafe\nreason","expected_revision":0,
+                "decision":"approved","reason":"unsafe\0reason","expected_revision":0,
                 "difficulty_ids":[selected],"difficulty_revisions":[{
                     "native_id":selected,"expected_revision":0,"expected_status_revision":0
                 }]
@@ -1422,6 +1422,32 @@ async fn approval_subset_validation_and_one_stale_difficulty_prevent_partial_pub
         assert_eq!(value["difficulties"][0]["status"],"pending");
         assert_eq!(value["availability"]["withdrawn"],false);
         assert_eq!(value["availability"]["revision"],2);
+    }).await;
+    fixture.finish(result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; isolated PostgreSQL 17 schema"]
+async fn nomination_rich_text_formats_and_multiline_reasons_roundtrip() {
+    let fixture = MutationFixture::new("nomination_rich_text", "http://127.0.0.1:1".into()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result = tokio::spawn(async move {
+        let (owner, _, _, cookie) = actor(&state, "RichNominationOwner", &["beatmaps.rank.request"]).await;
+        let (_, _, _, staff) = actor(&state, "RichNominationStaff", &["beatmaps.rank.review"]).await;
+        let set = local_set(&state, owner, &["pending"]).await;
+        let reason = "[b]Nomination[/b]\nSecond paragraph";
+        let (status, value) = request(&app,"POST",CREATE,Some(&cookie),json!({"native_set_id":set,"reason":reason,"reason_format":"bbcode"})).await;
+        assert_eq!(status,StatusCode::OK,"{value}");assert_eq!(value["reason"],reason);assert_eq!(value["reason_format"],"bbcode");
+        let id=value["id"].as_i64().unwrap();
+        let (status, reviewed) = request(&app,"PATCH",&format!("/api/v1/admin/beatmap-rank-requests/{id}"),Some(&staff),json!({"decision":"rejected","expected_revision":value["revision"],"reason":"**Review**\nNeeds work","reason_format":"markdown"})).await;
+        assert_eq!(status,StatusCode::OK,"{reviewed}");assert_eq!(reviewed["reason_format"],"bbcode");assert_eq!(reviewed["review_reason_format"],"markdown");assert_eq!(reviewed["review_reason"],"**Review**\nNeeds work");
+        let other_set=local_set(&state,owner,&["pending"]).await;
+        for format in ["html", "BBCode", ""] {
+            let before=snapshot(&state).await;
+            assert_eq!(request(&app,"POST",CREATE,Some(&cookie),json!({"native_set_id":other_set,"reason":"Valid","reason_format":format})).await.0,StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(snapshot(&state).await,before);
+        }
     }).await;
     fixture.finish(result).await;
 }

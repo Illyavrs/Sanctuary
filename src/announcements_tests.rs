@@ -164,7 +164,7 @@ async fn announcement_http_permissions_lifecycle_and_pagination() {
         let draft = create(&app, &manager, "  Original  ").await;
         assert_eq!(draft["title"], "Original");
         assert_eq!(draft["author"], json!({"id":creator,"username":"AnnouncementManager","avatar_url":null}));
-        assert_eq!(draft.as_object().unwrap().len(), 9);
+        assert_eq!(draft.as_object().unwrap().len(), 10);
         assert_eq!(snapshot(&state.db).await["audits"][0]["details"], json!({"id":draft["id"],"revision":1,"status":"draft"}));
         assert_eq!(get(&app, &format!("{ADMIN}/{}", draft["id"]), Some(&manager)).await, draft);
         for cookie in [None, Some(manager.as_str()), Some(wildcard.as_str())] {
@@ -464,4 +464,47 @@ async fn announcement_revision_conflicts_and_audit_failures_are_atomic() {
         }
     }).await;
     fixture.finish(outcome).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; isolated PostgreSQL 17 schema"]
+async fn rich_text_formats_roundtrip_and_weekly_renames_enforce_boundaries() {
+    let fixture = MutationFixture::new("rich_text", "http://127.0.0.1:1".into()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result = tokio::spawn(async move {
+        let (user, _, _, cookie) = actor(&state,"RichTextOwner", &["announcements.manage"]).await;
+        for format in ["bbcode", "markdown"] {
+            let text = if format == "bbcode" { "[b]Owned bio[/b]" } else { "**Owned bio**" };
+            let (status, profile) = request(&app,"PATCH","/api/v1/me/profile",Some(&cookie),json!({"bio":text,"bio_format":format})).await;
+            assert_eq!(status,StatusCode::OK,"{profile}");assert_eq!(profile["bio"],text);assert_eq!(profile["bio_format"],format);
+            let (status, profile) = request(&app,"PATCH","/api/v1/me/profile",Some(&cookie),json!({"bio":"Changed text"})).await;
+            assert_eq!(status,StatusCode::OK);assert_eq!(profile["bio_format"],format,"old clients preserve the explicit format");
+        }
+        let (status, created) = request(&app,"POST",ADMIN,Some(&cookie),json!({"title":"BBCode fixture","body":"[b]Body[/b]","body_format":"bbcode"})).await;
+        assert_eq!(status,StatusCode::CREATED,"{created}");assert_eq!(created["body_format"],"bbcode");
+        let path=format!("{ADMIN}/{}",created["id"]);
+        let (status, published)=request(&app,"PATCH",&path,Some(&cookie),json!({"revision":1,"title":"BBCode fixture","body":"[b]Published[/b]","status":"published"})).await;
+        assert_eq!(status,StatusCode::OK,"{published}");assert_eq!(published["body_format"],"bbcode");
+        let public=get(&app,&format!("{PUBLIC}/{}",created["id"]),None).await;assert_eq!(public["body_format"],"bbcode");assert_eq!(public["body"],"[b]Published[/b]");
+        for invalid in ["html","BBCode","javascript","", "markdown<script>"] {
+            let before=snapshot(&state.db).await;
+            assert_eq!(request(&app,"POST",ADMIN,Some(&cookie),json!({"title":"Bad","body":"body","body_format":invalid})).await.0,StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(request(&app,"PATCH","/api/v1/me/profile",Some(&cookie),json!({"bio":"bad","bio_format":invalid})).await.0,StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(snapshot(&state.db).await,before);
+        }
+        let mut tx=state.db.begin().await.unwrap();
+        sqlx::query("UPDATE users SET username_changed_at=now()-interval '7 days'+interval '1 second' WHERE id=$1").bind(user).execute(&mut *tx).await.unwrap();
+        let denied=crate::auth::rename_user_in_tx(&mut tx,user,"WeeklyNewName",user,true).await.unwrap_err();assert_eq!(denied.0,StatusCode::TOO_MANY_REQUESTS);assert_eq!(denied.1,"username_cooldown");tx.rollback().await.unwrap();
+        let mut tx=state.db.begin().await.unwrap();
+        sqlx::query("UPDATE users SET username_changed_at=now()-interval '7 days' WHERE id=$1").bind(user).execute(&mut *tx).await.unwrap();
+        crate::auth::rename_user_in_tx(&mut tx,user,"WeeklyNewName",user,true).await.unwrap();tx.commit().await.unwrap();
+        let mut tx=state.db.begin().await.unwrap();
+        assert_eq!(crate::auth::rename_user_in_tx(&mut tx,user,"WeeklyAgain",user,true).await.unwrap_err().1,"username_cooldown");tx.rollback().await.unwrap();
+        // Staff exemption and old-name reservation are unchanged.
+        let mut tx=state.db.begin().await.unwrap();crate::auth::rename_user_in_tx(&mut tx,user,"StaffRenamed",user,false).await.unwrap();tx.commit().await.unwrap();
+        let (other,_,_,_)=actor(&state,"RichTextOther",&[]).await;
+        let mut tx=state.db.begin().await.unwrap();assert!(crate::auth::rename_user_in_tx(&mut tx,other,"RichTextOwner",other,true).await.is_err());tx.rollback().await.unwrap();
+    }).await;
+    fixture.finish(result).await;
 }

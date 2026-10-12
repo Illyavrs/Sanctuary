@@ -51,12 +51,14 @@ fn reason(value: &str) -> ApiResult<&str> {
     if trimmed.is_empty()
         || trimmed.len() > 4000
         || trimmed.chars().count() > 1000
-        || trimmed.chars().any(char::is_control)
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
     {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "invalid_rank_request_reason",
-            "Supply a reason between 1 and 1000 characters without control characters.",
+            "Supply a reason between 1 and 1000 characters; only newlines and tabs are allowed as control characters.",
         ));
     }
     Ok(trimmed)
@@ -76,6 +78,8 @@ pub(crate) struct Create {
     official_set_id: Option<i64>,
     difficulty_ids: Option<Vec<i64>>,
     reason: String,
+    #[serde(default)]
+    reason_format: crate::rich_text::TextFormat,
 }
 impl Create {
     fn target(&self) -> ApiResult<(i64, &'static str)> {
@@ -116,6 +120,8 @@ pub(crate) struct Review {
     decision: String,
     expected_revision: i64,
     reason: String,
+    #[serde(default)]
+    reason_format: crate::rich_text::TextFormat,
     difficulty_ids: Option<Vec<i64>>,
     difficulty_revisions: Option<Vec<DifficultyRevision>>,
 }
@@ -182,11 +188,11 @@ pub(crate) fn routes() -> axum::Router<AppState> {
 const DTO: &str = r#"jsonb_build_object(
     'id',r.id,'native_set_id',r.native_set_id,'source',r.source,
     'requester',jsonb_build_object('id',u.id,'username',u.username,'country',u.country,'avatar_url',u.avatar_url),
-    'reason',r.reason,'status',r.status,'revision',r.revision,
+    'reason',r.reason,'reason_format',r.reason_format,'status',r.status,'revision',r.revision,
     'metadata',jsonb_build_object('title',r.metadata->'title','artist',r.metadata->'artist',
         'creator',r.metadata->'creator','difficulty_count',r.metadata->'difficulty_count',
         'official_url',r.metadata->'official_url'),
-    'review_reason',r.review_reason,'approved_difficulty_ids',r.approved_difficulty_ids,
+    'review_reason',r.review_reason,'review_reason_format',r.review_reason_format,'approved_difficulty_ids',r.approved_difficulty_ids,
     'difficulties',(SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'native_id',(m->>'native_id')::bigint,'version',m->'version','mode',m->'mode','stars',m->'stars',
         'status',COALESCE(o.status,b.status,m->>'status'),'revision',COALESCE(o.revision,0),'status_revision',b.status_revision)
@@ -493,8 +499,8 @@ pub(crate) async fn create(
     if sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM beatmap_rank_requests WHERE native_set_id=$1 AND status='pending')")
         .bind(set_id).fetch_one(&mut *tx).await? { return Err(error(StatusCode::CONFLICT,"rank_request_exists","An open request already exists for this set.")); }
     auth::ensure_mutation_actor(&mut tx, &actor).await?;
-    let id:i64 = sqlx::query_scalar("INSERT INTO beatmap_rank_requests(native_set_id,source,requester_id,reason,metadata) VALUES($1,$2,$3,$4,$5) RETURNING id")
-        .bind(set_id).bind(source).bind(actor.id).bind(reason).bind(metadata).fetch_one(&mut *tx).await?;
+    let id:i64 = sqlx::query_scalar("INSERT INTO beatmap_rank_requests(native_set_id,source,requester_id,reason,metadata,reason_format) VALUES($1,$2,$3,$4,$5,$6) RETURNING id")
+        .bind(set_id).bind(source).bind(actor.id).bind(reason).bind(metadata).bind(input.reason_format.as_str()).fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'beatmaps.rank_request.create','beatmap_rank_request',$2,$3)")
         .bind(actor.id).bind(id.to_string()).bind(json!({"native_set_id":set_id,"source":source})).execute(&mut *tx).await?;
     let value = projection(&mut *tx, id).await?;
@@ -1045,8 +1051,8 @@ pub(crate) async fn review(
     let approved = selected
         .as_ref()
         .map(|ids| ids.iter().copied().collect::<Vec<_>>());
-    sqlx::query("UPDATE beatmap_rank_requests SET status=$2,review_reason=$3,reviewed_by=$4,reviewed_at=clock_timestamp(),approved_difficulty_ids=$5 WHERE id=$1")
-        .bind(id).bind(&input.decision).bind(reason).bind(actor.id).bind(&approved).execute(&mut *tx).await?;
+    sqlx::query("UPDATE beatmap_rank_requests SET status=$2,review_reason=$3,reviewed_by=$4,reviewed_at=clock_timestamp(),approved_difficulty_ids=$5,review_reason_format=$6 WHERE id=$1")
+        .bind(id).bind(&input.decision).bind(reason).bind(actor.id).bind(&approved).bind(input.reason_format.as_str()).execute(&mut *tx).await?;
     crate::notifications::rank_request_decided(&mut tx, id).await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'beatmaps.rank_request.review','beatmap_rank_request',$2,$3)")
         .bind(actor.id).bind(id.to_string()).bind(json!({"native_set_id":set_id,"decision":input.decision,"difficulty_ids":approved,"reason":reason,"previous_revision":input.expected_revision})).execute(&mut *tx).await?;
@@ -1075,7 +1081,8 @@ mod validation_tests {
     #[test]
     fn reasons_and_target_selectors_are_bounded() {
         assert_eq!(reason("  ready for review  ").unwrap(), "ready for review");
-        for invalid in ["", "   ", "line\nline", "nul\0byte", "\u{7f}"] {
+        assert_eq!(reason("line\n\tline").unwrap(), "line\n\tline");
+        for invalid in ["", "   ", "line\rline", "nul\0byte", "\u{7f}"] {
             assert!(reason(invalid).is_err());
         }
         assert!(reason(&"譜".repeat(1000)).is_ok());
@@ -1092,7 +1099,8 @@ mod validation_tests {
                     native_set_id: native,
                     official_set_id: official,
                     difficulty_ids: None,
-                    reason: "ok".into()
+                    reason: "ok".into(),
+                    reason_format: Default::default()
                 }
                 .target()
                 .is_err()
@@ -1103,7 +1111,8 @@ mod validation_tests {
                 native_set_id: Some(LOCAL_SET_MIN),
                 official_set_id: None,
                 difficulty_ids: None,
-                reason: "ok".into()
+                reason: "ok".into(),
+                reason_format: Default::default()
             }
             .target()
             .unwrap(),
@@ -1114,7 +1123,8 @@ mod validation_tests {
                 native_set_id: None,
                 official_set_id: Some(1),
                 difficulty_ids: None,
-                reason: "ok".into()
+                reason: "ok".into(),
+                reason_format: Default::default()
             }
             .target()
             .unwrap(),

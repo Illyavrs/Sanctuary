@@ -5,6 +5,7 @@ mod announcements;
 #[cfg(test)]
 mod announcements_tests;
 mod auth;
+mod rich_text;
 mod beatmap_availability;
 #[cfg(test)]
 mod beatmap_availability_tests;

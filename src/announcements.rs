@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 // Expose only the creator's public identity, never the complete users row.
 const RECORD: &str = "jsonb_build_object(\
-    'id',a.id,'title',a.title,'body',a.body,'status',a.status,'revision',a.revision,\
+    'id',a.id,'title',a.title,'body',a.body,'body_format',a.body_format,'status',a.status,'revision',a.revision,\
     'created_at',a.created_at,'updated_at',a.updated_at,'published_at',a.published_at,\
     'author',jsonb_build_object('id',u.id,'username',u.username,'avatar_url',u.avatar_url))";
 
@@ -32,6 +32,8 @@ pub struct AdminListQuery {
 pub struct CreateInput {
     title: String,
     body: String,
+    #[serde(default)]
+    body_format: crate::rich_text::TextFormat,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +42,7 @@ pub struct UpdateInput {
     revision: i64,
     title: String,
     body: String,
+    body_format: Option<crate::rich_text::TextFormat>,
     status: String,
 }
 
@@ -178,11 +181,12 @@ pub async fn create(
     actor.require("announcements.manage")?;
     auth::ensure_mutation_actor(&mut tx, &actor).await?;
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO announcements(title,body,created_by,updated_by) VALUES($1,$2,$3,$3) RETURNING id",
+        "INSERT INTO announcements(title,body,created_by,updated_by,body_format) VALUES($1,$2,$3,$3,$4) RETURNING id",
     )
     .bind(title)
     .bind(body)
     .bind(actor.id)
+    .bind(input.body_format.as_str())
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query("INSERT INTO audit_events(actor_id,action,target_type,target_id,details) VALUES($1,'announcements.create','announcement',$2,$3)")
@@ -233,7 +237,7 @@ pub async fn update(
         .checked_add(1)
         .ok_or_else(|| ApiError::bad("The announcement revision is exhausted."))?;
     sqlx::query(
-        "UPDATE announcements SET title=$2,body=$3,status=$4,revision=$6,updated_by=$5,\
+        "UPDATE announcements SET title=$2,body=$3,status=$4,revision=$6,updated_by=$5,body_format=COALESCE($7,body_format),\
          updated_at=clock_timestamp(),published_at=CASE WHEN $4='published' AND status<>'published' \
          THEN clock_timestamp() ELSE published_at END WHERE id=$1",
     )
@@ -243,6 +247,7 @@ pub async fn update(
     .bind(&input.status)
     .bind(actor.id)
     .bind(next_revision)
+    .bind(input.body_format.map(|format| format.as_str()))
     .execute(&mut *tx)
     .await?;
     if input.status == "published" && status != "published" {

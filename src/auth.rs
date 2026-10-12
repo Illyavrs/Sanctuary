@@ -214,14 +214,14 @@ pub(crate) async fn profile_in_variant(
     variant: ScoreVariant,
 ) -> ApiResult<Value> {
     scores::validate_partition(mode, variant)?;
-    let row=sqlx::query("SELECT id,username,email,email_verified_at,country,bio,avatar_url,banner_url,accent_color,banner_position_x,banner_position_y,preferred_mode,preferred_variant,preferences,joined_at,is_restricted FROM users WHERE id=$1 AND ($2 OR NOT is_restricted)")
+    let row=sqlx::query("SELECT id,username,email,email_verified_at,country,bio,bio_format,avatar_url,banner_url,accent_color,banner_position_x,banner_position_y,preferred_mode,preferred_variant,preferences,joined_at,is_restricted FROM users WHERE id=$1 AND ($2 OR NOT is_restricted)")
         .bind(id).bind(private).fetch_optional(&state.db).await?.ok_or_else(ApiError::missing)?;
     let roles=sqlx::query_scalar::<_,String>("SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 ORDER BY r.id").bind(id).fetch_all(&state.db).await?;
     let permissions=sqlx::query_scalar::<_,String>("SELECT DISTINCT unnest(r.permissions) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1").bind(id).fetch_all(&state.db).await?;
     let stats = scores::statistics(state, id, mode, variant).await?;
     let preferences: Preferences =
         serde_json::from_value(row.get::<Value, _>("preferences")).unwrap_or_default();
-    let mut value = json!({"id":id,"username":row.get::<String,_>("username"),"country":row.get::<String,_>("country"),"bio":row.get::<String,_>("bio"),"avatar_url":row.get::<Option<String>,_>("avatar_url"),"banner_url":row.get::<Option<String>,_>("banner_url"),"accent_color":row.get::<String,_>("accent_color"),"banner_position_x":row.get::<i32,_>("banner_position_x"),"banner_position_y":row.get::<i32,_>("banner_position_y"),"preferred_mode":row.get::<i16,_>("preferred_mode"),"preferred_variant":row.get::<String,_>("preferred_variant"),"roles":roles,"joined_at":row.get::<chrono::DateTime<Utc>,_>("joined_at"),"pp":stats["pp"],"play_count":stats["play_count"],"accuracy":stats["accuracy"],"statistics":stats});
+    let mut value = json!({"id":id,"username":row.get::<String,_>("username"),"country":row.get::<String,_>("country"),"bio":row.get::<String,_>("bio"),"bio_format":row.get::<String,_>("bio_format"),"avatar_url":row.get::<Option<String>,_>("avatar_url"),"banner_url":row.get::<Option<String>,_>("banner_url"),"accent_color":row.get::<String,_>("accent_color"),"banner_position_x":row.get::<i32,_>("banner_position_x"),"banner_position_y":row.get::<i32,_>("banner_position_y"),"preferred_mode":row.get::<i16,_>("preferred_mode"),"preferred_variant":row.get::<String,_>("preferred_variant"),"roles":roles,"joined_at":row.get::<chrono::DateTime<Utc>,_>("joined_at"),"pp":stats["pp"],"play_count":stats["play_count"],"accuracy":stats["accuracy"],"statistics":stats});
     // Only roles flagged as badges are public; the rest stay permission plumbing.
     let groups = sqlx::query("SELECT r.id,r.name,r.short_name,r.colour,r.icon FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 AND r.display_badge ORDER BY r.rank DESC,r.id")
         .bind(id).fetch_all(&state.db).await?;
@@ -476,6 +476,7 @@ pub async fn update_preferences(
 #[serde(deny_unknown_fields)]
 pub struct ProfilePatch {
     bio: Option<String>,
+    bio_format: Option<crate::rich_text::TextFormat>,
     country: Option<String>,
     accent_color: Option<String>,
     banner_position_x: Option<i32>,
@@ -536,7 +537,7 @@ pub async fn update_profile(
     }
     let mut tx = state.db.begin().await?;
     let user = mutation_actor(&mut tx, &user, &[], MutationScope::Session).await?;
-    sqlx::query("UPDATE users SET bio=COALESCE($2,bio),country=COALESCE($3,country),accent_color=COALESCE($4,accent_color),banner_position_x=COALESCE($5,banner_position_x),banner_position_y=COALESCE($6,banner_position_y),preferred_mode=COALESCE($7,preferred_mode),preferred_variant=COALESCE($8,preferred_variant) WHERE id=$1").bind(user.id).bind(input.bio).bind(input.country).bind(input.accent_color).bind(input.banner_position_x).bind(input.banner_position_y).bind(input.preferred_mode).bind(&input.preferred_variant).execute(&mut *tx).await?;
+    sqlx::query("UPDATE users SET bio=COALESCE($2,bio),country=COALESCE($3,country),accent_color=COALESCE($4,accent_color),banner_position_x=COALESCE($5,banner_position_x),banner_position_y=COALESCE($6,banner_position_y),preferred_mode=COALESCE($7,preferred_mode),preferred_variant=COALESCE($8,preferred_variant),bio_format=COALESCE($9,bio_format) WHERE id=$1").bind(user.id).bind(input.bio).bind(input.country).bind(input.accent_color).bind(input.banner_position_x).bind(input.banner_position_y).bind(input.preferred_mode).bind(&input.preferred_variant).bind(input.bio_format.map(|format| format.as_str())).execute(&mut *tx).await?;
     ensure_mutation_actor(&mut tx, &user).await?;
     tx.commit().await?;
     Ok(Json(profile(&state, user.id, true).await?))
@@ -856,7 +857,7 @@ pub async fn bootstrap(state: &AppState) -> ApiResult<()> {
 }
 
 /// A player may rename once per this many days; staff renames do not use the allowance.
-const USERNAME_COOLDOWN_DAYS: i64 = 30;
+const USERNAME_COOLDOWN_DAYS: i64 = 7;
 /// A released name stays reserved for its previous owner this long.
 const USERNAME_RESERVED_DAYS: i64 = 90;
 
