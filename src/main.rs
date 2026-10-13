@@ -60,6 +60,9 @@ mod rank_requests;
 mod rbac_tests;
 #[cfg(test)]
 mod relax_tests;
+mod rewards;
+#[cfg(test)]
+mod rewards_tests;
 mod score_recalculation;
 mod score_recovery;
 mod score_resubmission;
@@ -361,6 +364,7 @@ fn router(state: AppState) -> Router {
         ]);
     Router::new()
         .merge(rank_requests::routes())
+        .merge(rewards::routes())
         .route(
             "/api/v1/server/beatmapsets",
             get(server_catalogue::list).layer(SetResponseHeaderLayer::overriding(

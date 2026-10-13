@@ -222,6 +222,7 @@ pub(crate) async fn profile_in_variant(
     let preferences: Preferences =
         serde_json::from_value(row.get::<Value, _>("preferences")).unwrap_or_default();
     let mut value = json!({"id":id,"username":row.get::<String,_>("username"),"country":row.get::<String,_>("country"),"bio":row.get::<String,_>("bio"),"bio_format":row.get::<String,_>("bio_format"),"avatar_url":row.get::<Option<String>,_>("avatar_url"),"banner_url":row.get::<Option<String>,_>("banner_url"),"accent_color":row.get::<String,_>("accent_color"),"banner_position_x":row.get::<i32,_>("banner_position_x"),"banner_position_y":row.get::<i32,_>("banner_position_y"),"preferred_mode":row.get::<i16,_>("preferred_mode"),"preferred_variant":row.get::<String,_>("preferred_variant"),"roles":roles,"joined_at":row.get::<chrono::DateTime<Utc>,_>("joined_at"),"pp":stats["pp"],"play_count":stats["play_count"],"accuracy":stats["accuracy"],"statistics":stats});
+    value["cosmetics"] = crate::rewards::profile_equipment(state, id).await?;
     // Only roles flagged as badges are public; the rest stay permission plumbing.
     let groups = sqlx::query("SELECT r.id,r.name,r.short_name,r.colour,r.icon FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 AND r.display_badge ORDER BY r.rank DESC,r.id")
         .bind(id).fetch_all(&state.db).await?;
