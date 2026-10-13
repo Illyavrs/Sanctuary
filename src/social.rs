@@ -6,6 +6,11 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
+
+#[cfg(test)]
+#[path = "public_card_tests.rs"]
+mod public_card_tests;
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,15 +50,80 @@ pub const CARD: &str = "jsonb_build_object(\
     'cosmetics',jsonb_build_object('title',\
         (SELECT jsonb_build_object('id',r.id,'name',r.name,'description',r.description,\
             'kind',r.kind,'price',r.price,'color',r.color,'style',r.style,\
-            'active',r.active,'revision',r.revision) \
+            'active',r.active,'revision',r.revision,'image_url',r.image_url) \
          FROM reward_equipment e JOIN reward_catalog r ON r.id=e.title_id \
          WHERE e.user_id=u.id AND r.kind='title'),\
         'avatar_frame',\
         (SELECT jsonb_build_object('id',r.id,'name',r.name,'description',r.description,\
             'kind',r.kind,'price',r.price,'color',r.color,'style',r.style,\
-            'active',r.active,'revision',r.revision) \
+            'active',r.active,'revision',r.revision,'image_url',r.image_url) \
          FROM reward_equipment e JOIN reward_catalog r ON r.id=e.avatar_frame_id \
          WHERE e.user_id=u.id AND r.kind='avatar_frame')))";
+
+/// A bounded public projection for avatar decorations and hover cards. Missing
+/// or restricted players have the same response, independently of the viewer.
+pub async fn card(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    if id <= 0 {
+        return Err(ApiError::bad("Choose a positive player ID."));
+    }
+    let item = sqlx::query_scalar::<_, Value>(&format!(
+        "SELECT {CARD} FROM users u WHERE u.id=$1 AND NOT u.is_restricted"
+    ))
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(ApiError::missing)?;
+    Ok(Json(item))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardQuery {
+    ids: Option<String>,
+}
+
+fn card_ids(query: CardQuery) -> ApiResult<Vec<i64>> {
+    let invalid = || ApiError::bad("Provide between 1 and 60 positive player IDs.");
+    let raw = query.ids.ok_or_else(invalid)?;
+    if raw.len() > 60 * 19 + 59 {
+        return Err(invalid());
+    }
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    // Bound the supplied list before deduplication, so repeated IDs cannot turn
+    // this small lookup into an unbounded parsing or database workload.
+    for (index, item) in raw.split(',').enumerate() {
+        if index >= 60
+            || item.is_empty()
+            || item.len() > 19
+            || !item.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid());
+        }
+        let id = item.parse::<i64>().map_err(|_| invalid())?;
+        if id <= 0 {
+            return Err(invalid());
+        }
+        if seen.insert(id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// One query serves a page of player avatars. Do not expose per-player missing
+/// reasons or private account/reward state in this public endpoint.
+pub async fn cards(State(state): State<AppState>, Query(query): Query<CardQuery>) -> ApiResult {
+    let ids = card_ids(query)?;
+    let items = sqlx::query_scalar::<_, Value>(&format!(
+        "SELECT {CARD} FROM users u WHERE u.id=ANY($1) AND NOT u.is_restricted \
+         ORDER BY array_position($1::bigint[],u.id)"
+    ))
+    .bind(ids)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(json!({"items":items})))
+}
 
 #[derive(Deserialize)]
 pub struct OnlineQuery {

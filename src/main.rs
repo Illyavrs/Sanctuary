@@ -59,6 +59,7 @@ mod rank_requests;
 mod rbac_tests;
 #[cfg(test)]
 mod relax_tests;
+mod reward_frame_media;
 mod rewards;
 #[cfg(test)]
 mod rewards_tests;
@@ -272,6 +273,7 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
         } else if mutating
             && (path.ends_with("/upload")
                 || path.ends_with("/media")
+                || (path.starts_with("/api/v1/admin/rewards/") && path.ends_with("/image"))
                 || path == "/api/v1/beatmaps/import/archive")
         {
             Some((10, 600, "upload"))
@@ -437,6 +439,8 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/me/username", post(auth::change_username))
         .route("/api/v1/me/relationships", get(social::list))
         .route("/api/v1/users/online", get(social::online))
+        .route("/api/v1/users/cards", get(social::cards))
+        .route("/api/v1/users/{id}/card", get(social::card))
         .route(
             "/api/v1/me/relationships/{id}",
             post(social::change)
@@ -711,6 +715,10 @@ fn router(state: AppState) -> Router {
         .nest_service(
             "/media/background",
             ServeDir::new(state.media_root.join("background")),
+        )
+        .nest_service(
+            "/media/reward-frames",
+            ServeDir::new(state.media_root.join("reward-frames")),
         )
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), guard))

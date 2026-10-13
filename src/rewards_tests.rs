@@ -326,7 +326,7 @@ fn assert_card_cosmetics(card: &Value, cosmetics: &Value) {
     assert_eq!(object.len(), 2);
     for key in ["title", "avatar_frame"] {
         if let Some(reward) = object[key].as_object() {
-            assert_eq!(reward.len(), 9, "public reward fields: {reward:?}");
+            assert_eq!(reward.len(), 10, "public reward fields: {reward:?}");
             for field in [
                 "id",
                 "name",

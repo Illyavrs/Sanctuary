@@ -3,7 +3,7 @@
 use crate::{ApiError, ApiResult, AppState, auth, page};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::HeaderMap,
     http::StatusCode,
     routing::{get, patch, post},
@@ -16,7 +16,7 @@ use sqlx::{Postgres, Transaction};
 
 type Tx<'a> = Transaction<'a, Postgres>;
 const REWARD: &str = "jsonb_build_object('id',r.id,'name',r.name,'description',r.description,\
-    'kind',r.kind,'price',r.price,'color',r.color,'style',r.style,'active',r.active,'revision',r.revision)";
+    'kind',r.kind,'price',r.price,'color',r.color,'style',r.style,'image_url',r.image_url,'active',r.active,'revision',r.revision)";
 const MISSIONS: [(&str, i64); 3] = [("play_5", 5), ("maps_3", 3), ("variety_2", 2)];
 const MISSION_REWARD: i64 = 20;
 
@@ -29,6 +29,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/me/rewards/equipment", patch(equip))
         .route("/api/v1/admin/rewards", get(admin_list).post(create))
         .route("/api/v1/admin/rewards/{id}", patch(update).delete(remove))
+        .route(
+            "/api/v1/admin/rewards/{id}/image",
+            post(crate::reward_frame_media::upload)
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024 + 16 * 1024)),
+        )
 }
 
 #[derive(Deserialize)]
@@ -128,18 +133,21 @@ fn validate_reward(mut input: RewardInput) -> ApiResult<RewardInput> {
     }
     let valid_style = match input.kind.as_str() {
         "title" => input.style.is_none(),
-        "avatar_frame" => matches!(input.style.as_deref(), Some("line" | "double" | "corners")),
+        "avatar_frame" => matches!(
+            input.style.as_deref(),
+            Some("line" | "double" | "corners" | "image")
+        ),
         _ => false,
     };
     if !valid_style {
         return Err(ApiError::bad(
-            "Titles have no style; avatar frames use line, double or corners.",
+            "Titles have no style; avatar frames use line, double, corners or image.",
         ));
     }
     Ok(input)
 }
 
-fn positive(value: i64) -> ApiResult<()> {
+pub(crate) fn positive(value: i64) -> ApiResult<()> {
     if value > 0 {
         Ok(())
     } else {
@@ -147,11 +155,11 @@ fn positive(value: i64) -> ApiResult<()> {
     }
 }
 
-fn conflict(code: &'static str, message: &str) -> ApiError {
+pub(crate) fn conflict(code: &'static str, message: &str) -> ApiError {
     ApiError(StatusCode::CONFLICT, code, message.into())
 }
 
-fn revision_matches(expected: i64, actual: i64) -> ApiResult<()> {
+pub(crate) fn revision_matches(expected: i64, actual: i64) -> ApiResult<()> {
     if expected == actual {
         Ok(())
     } else {
@@ -287,7 +295,7 @@ async fn lock_wallet(tx: &mut Tx<'_>, user_id: i64) -> ApiResult<i64> {
     )
 }
 
-async fn audit_in(
+pub(crate) async fn audit_in(
     tx: &mut Tx<'_>,
     actor: i64,
     action: &str,
@@ -419,8 +427,8 @@ async fn purchase(
     let actor = auth::mutation_actor(&mut tx, &snapshot, &[], auth::MutationScope::Session).await?;
     let balance = lock_wallet(&mut tx, actor.id).await?;
     // Catalog locks follow the wallet and never lead back to any player lock.
-    let (price, active, revision): (i64, bool, i64) =
-        sqlx::query_as("SELECT price,active,revision FROM reward_catalog WHERE id=$1 FOR UPDATE")
+    let (price, active, revision, ready): (i64, bool, i64, bool) =
+        sqlx::query_as("SELECT price,active,revision,(style IS DISTINCT FROM 'image' OR image_url IS NOT NULL) FROM reward_catalog WHERE id=$1 FOR UPDATE")
             .bind(input.reward_id)
             .fetch_optional(&mut *tx)
             .await?
@@ -439,7 +447,7 @@ async fn purchase(
         return mutation_response(tx, &actor, true).await;
     }
     revision_matches(input.revision, revision)?;
-    if !active {
+    if !active || !ready {
         return Err(conflict(
             "reward_unavailable",
             "This reward is no longer available.",
@@ -500,8 +508,8 @@ async fn equip(
     lock_wallet(&mut tx, actor.id).await?;
     // Multi-reward operations lock sorted IDs so simultaneous equipment/admin
     // edits cannot acquire the same catalog rows in opposite orders.
-    let records: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id,kind FROM reward_catalog WHERE id=ANY($1) ORDER BY id FOR UPDATE",
+    let records: Vec<(i64, String, bool)> = sqlx::query_as(
+        "SELECT id,kind,(style IS DISTINCT FROM 'image' OR image_url IS NOT NULL) FROM reward_catalog WHERE id=ANY($1) ORDER BY id FOR UPDATE",
     )
     .bind(&ids)
     .fetch_all(&mut *tx)
@@ -527,12 +535,18 @@ async fn equip(
         if let Some(id) = id
             && !records
                 .iter()
-                .any(|(reward_id, kind)| *reward_id == id && kind == expected)
+                .any(|(reward_id, kind, _)| *reward_id == id && kind == expected)
         {
             return Err(ApiError::bad(
                 "That reward does not match the equipment slot.",
             ));
         }
+    }
+    if records.iter().any(|(_, _, ready)| !ready) {
+        return Err(conflict(
+            "reward_image_required",
+            "Upload an image before equipping this avatar frame.",
+        ));
     }
     // Availability is deliberately irrelevant for existing owners.
     sqlx::query(
@@ -560,7 +574,7 @@ fn admin_record_sql() -> String {
     )
 }
 
-async fn admin_record(tx: &mut Tx<'_>, id: i64) -> ApiResult<Value> {
+pub(crate) async fn admin_record(tx: &mut Tx<'_>, id: i64) -> ApiResult<Value> {
     sqlx::query_scalar::<_, Value>(&format!(
         "SELECT {} FROM reward_catalog r WHERE r.id=$1",
         admin_record_sql()
@@ -607,6 +621,12 @@ async fn create(
     let snapshot = auth::require(&state, &headers).await?;
     snapshot.require("rewards.manage")?;
     let input = validate_reward(input)?;
+    if input.style.as_deref() == Some("image") && input.active {
+        return Err(conflict(
+            "reward_image_required",
+            "Save the frame as a draft, upload its image, then publish it.",
+        ));
+    }
     let mut tx = state.db.begin().await?;
     let actor =
         auth::mutation_actor(&mut tx, &snapshot, &[], auth::MutationScope::Permissions).await?;
@@ -670,14 +690,28 @@ async fn update(
             "Owned rewards cannot change kind. You can take this reward off sale.",
         ));
     }
+    let image_url = if input.kind == "avatar_frame" && input.style.as_deref() == Some("image") {
+        before["image_url"].as_str()
+    } else {
+        None
+    };
+    if input.style.as_deref() == Some("image")
+        && image_url.is_none()
+        && (input.active || before["owned_count"].as_i64().unwrap_or(0) > 0)
+    {
+        return Err(conflict(
+            "reward_image_required",
+            "Upload the frame image before publishing or changing an owned frame to image style.",
+        ));
+    }
     let next = revision
         .checked_add(1)
         .ok_or_else(|| ApiError::bad("The reward revision is exhausted."))?;
     sqlx::query(
         "UPDATE reward_catalog SET name=$2,description=$3,kind=$4,price=$5,color=$6,style=$7,active=$8,\
-         revision=$9,updated_at=clock_timestamp() WHERE id=$1"
+         revision=$9,image_url=$10,updated_at=clock_timestamp() WHERE id=$1"
     ).bind(id).bind(input.name).bind(input.description).bind(input.kind).bind(input.price)
-        .bind(input.color).bind(input.style).bind(input.active).bind(next).execute(&mut *tx).await?;
+        .bind(input.color).bind(input.style).bind(input.active).bind(next).bind(image_url).execute(&mut *tx).await?;
     let item = admin_record(&mut tx, id).await?;
     audit_in(
         &mut tx,
