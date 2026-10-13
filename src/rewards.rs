@@ -524,15 +524,14 @@ async fn equip(
         (input.title_id, "title"),
         (input.avatar_frame_id, "avatar_frame"),
     ] {
-        if let Some(id) = id {
-            if !records
+        if let Some(id) = id
+            && !records
                 .iter()
                 .any(|(reward_id, kind)| *reward_id == id && kind == expected)
-            {
-                return Err(ApiError::bad(
-                    "That reward does not match the equipment slot.",
-                ));
-            }
+        {
+            return Err(ApiError::bad(
+                "That reward does not match the equipment slot.",
+            ));
         }
     }
     // Availability is deliberately irrelevant for existing owners.
@@ -562,14 +561,14 @@ fn admin_record_sql() -> String {
 }
 
 async fn admin_record(tx: &mut Tx<'_>, id: i64) -> ApiResult<Value> {
-    Ok(sqlx::query_scalar::<_, Value>(&format!(
+    sqlx::query_scalar::<_, Value>(&format!(
         "SELECT {} FROM reward_catalog r WHERE r.id=$1",
         admin_record_sql()
     ))
     .bind(id)
     .fetch_optional(&mut **tx)
     .await?
-    .ok_or_else(ApiError::missing)?)
+    .ok_or_else(ApiError::missing)
 }
 
 async fn admin_list(

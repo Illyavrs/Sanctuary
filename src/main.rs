@@ -5,7 +5,6 @@ mod announcements;
 #[cfg(test)]
 mod announcements_tests;
 mod auth;
-mod rich_text;
 mod beatmap_availability;
 #[cfg(test)]
 mod beatmap_availability_tests;
@@ -63,6 +62,7 @@ mod relax_tests;
 mod rewards;
 #[cfg(test)]
 mod rewards_tests;
+mod rich_text;
 mod score_recalculation;
 mod score_recovery;
 mod score_resubmission;

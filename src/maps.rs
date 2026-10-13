@@ -2002,6 +2002,64 @@ pub(crate) mod map_package_tests;
 #[path = "uploaded_map_list_tests.rs"]
 mod uploaded_map_list_tests;
 
+/// Short link for a single difficulty: `/beatmaps/<difficulty id>` resolves to its set. Imported and
+/// local maps resolve from the database; any other id is looked up once through the official API.
+pub async fn resolve_difficulty(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    if !(1..=i64::from(i32::MAX)).contains(&id) {
+        return Err(ApiError::bad("Invalid beatmap identity."));
+    }
+    let known = sqlx::query(
+        "SELECT source, COALESCE(native_set_id, official_set_id) AS set_id, mode FROM beatmaps \
+         WHERE native_id=$1 ORDER BY id LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some(row) = known {
+        let set_id: Option<i64> = row.get("set_id");
+        if let Some(set_id) = set_id {
+            return Ok(Json(json!({
+                "source": row.get::<String, _>("source"),
+                "set_id": set_id,
+                "mode": row.get::<i16, _>("mode"),
+                "id": id,
+            })));
+        }
+    }
+    if id > MAX_OFFICIAL_ID {
+        return Err(ApiError::missing());
+    }
+    let response = official_request(&state, &format!("/api/v2/beatmaps/{id}"), true).await?;
+    let metadata: Value = serde_json::from_slice(
+        &read_official_bytes(response, 1024 * 1024).await?,
+    )
+    .map_err(|_| {
+        upstream_error(
+            "official_api_failed",
+            "The official beatmap metadata was invalid.",
+        )
+    })?;
+    let (Some(official_id), Some(set_id), Some(mode)) = (
+        metadata["id"].as_i64(),
+        metadata["beatmapset_id"].as_i64(),
+        metadata["mode_int"].as_i64(),
+    ) else {
+        return Err(upstream_error(
+            "official_identity_mismatch",
+            "Official metadata and beatmap identity did not match.",
+        ));
+    };
+    if official_id != id || !(1..=MAX_OFFICIAL_ID).contains(&set_id) || !(0..=3).contains(&mode) {
+        return Err(upstream_error(
+            "official_identity_mismatch",
+            "Official metadata and beatmap identity did not match.",
+        ));
+    }
+    Ok(Json(
+        json!({"source":"official","set_id":set_id,"mode":mode,"id":id}),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2283,62 +2341,4 @@ mod tests {
         assert_eq!(map.max_combo, 2);
         assert_eq!(map.bpm, 120.0);
     }
-}
-
-/// Short link for a single difficulty: `/beatmaps/<difficulty id>` resolves to its set. Imported and
-/// local maps resolve from the database; any other id is looked up once through the official API.
-pub async fn resolve_difficulty(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
-    if !(1..=i64::from(i32::MAX)).contains(&id) {
-        return Err(ApiError::bad("Invalid beatmap identity."));
-    }
-    let known = sqlx::query(
-        "SELECT source, COALESCE(native_set_id, official_set_id) AS set_id, mode FROM beatmaps \
-         WHERE native_id=$1 ORDER BY id LIMIT 1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-    if let Some(row) = known {
-        let set_id: Option<i64> = row.get("set_id");
-        if let Some(set_id) = set_id {
-            return Ok(Json(json!({
-                "source": row.get::<String, _>("source"),
-                "set_id": set_id,
-                "mode": row.get::<i16, _>("mode"),
-                "id": id,
-            })));
-        }
-    }
-    if id > MAX_OFFICIAL_ID {
-        return Err(ApiError::missing());
-    }
-    let response = official_request(&state, &format!("/api/v2/beatmaps/{id}"), true).await?;
-    let metadata: Value = serde_json::from_slice(
-        &read_official_bytes(response, 1024 * 1024).await?,
-    )
-    .map_err(|_| {
-        upstream_error(
-            "official_api_failed",
-            "The official beatmap metadata was invalid.",
-        )
-    })?;
-    let (Some(official_id), Some(set_id), Some(mode)) = (
-        metadata["id"].as_i64(),
-        metadata["beatmapset_id"].as_i64(),
-        metadata["mode_int"].as_i64(),
-    ) else {
-        return Err(upstream_error(
-            "official_identity_mismatch",
-            "Official metadata and beatmap identity did not match.",
-        ));
-    };
-    if official_id != id || !(1..=MAX_OFFICIAL_ID).contains(&set_id) || !(0..=3).contains(&mode) {
-        return Err(upstream_error(
-            "official_identity_mismatch",
-            "Official metadata and beatmap identity did not match.",
-        ));
-    }
-    Ok(Json(
-        json!({"source":"official","set_id":set_id,"mode":mode,"id":id}),
-    ))
 }

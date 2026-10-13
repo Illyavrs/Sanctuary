@@ -268,8 +268,8 @@ pub async fn playtime_leaderboard(
         FROM placed p JOIN users u ON u.id=p.user_id ORDER BY p.position LIMIT $2 OFFSET $3",
     )
     .bind(&query.country)
-    .bind(i64::from(size))
-    .bind(i64::from(offset))
+    .bind(size)
+    .bind(offset)
     .fetch_all(&state.db)
     .await?;
     Ok(Json(page(items, total, p, size).0))
