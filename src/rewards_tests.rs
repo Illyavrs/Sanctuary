@@ -305,6 +305,272 @@ async fn accounting(db: &PgPool, user: i64) -> (i64, i64, i64) {
     .unwrap()
 }
 
+fn assert_card_cosmetics(card: &Value, cosmetics: &Value) {
+    assert_eq!(card["cosmetics"], *cosmetics, "{card}");
+    for private_key in [
+        "balance",
+        "inventory",
+        "missions",
+        "ledger",
+        "equipment",
+        "permissions",
+        "email",
+        "password_hash",
+    ] {
+        assert!(
+            card.get(private_key).is_none(),
+            "public card leaked {private_key}: {card}"
+        );
+    }
+    let object = card["cosmetics"].as_object().unwrap();
+    assert_eq!(object.len(), 2);
+    for key in ["title", "avatar_frame"] {
+        if let Some(reward) = object[key].as_object() {
+            assert_eq!(reward.len(), 9, "public reward fields: {reward:?}");
+            for field in [
+                "id",
+                "name",
+                "description",
+                "kind",
+                "price",
+                "color",
+                "style",
+                "active",
+                "revision",
+            ] {
+                assert!(reward.contains_key(field), "missing public field {field}");
+            }
+        }
+    }
+}
+
+fn listed_card(items: &Value, user: i64) -> &Value {
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == user)
+        .unwrap_or_else(|| panic!("missing card {user}: {items}"))
+}
+
+fn relationship_card(items: &Value, user: i64) -> &Value {
+    &items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["target_id"] == user)
+        .unwrap_or_else(|| panic!("missing relationship {user}: {items}"))["target"]
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; owned disposable PostgreSQL 17"]
+async fn rewards_public_cards_show_only_equipped_cosmetics_and_preserve_visibility() {
+    let fixture = MutationFixture::new("rewards_public_cards", "http://127.0.0.1:1".into()).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
+    let result = tokio::spawn(async move {
+        let (_, _, _, manager) = actor(&state, "CardRewardManager", &["rewards.manage"]).await;
+        let (owner, badge, _, owner_cookie) = actor(&state, "CardRewardOwner", &[]).await;
+        let (_, _, _, viewer_cookie) = actor(&state, "CardRewardViewer", &["social.manage"]).await;
+        let (bare, _, _, _) = actor(&state, "CardRewardBare", &[]).await;
+        let (restricted, _, _, _) = actor(&state, "CardRewardRestricted", &[]).await;
+        sqlx::query(
+            "UPDATE roles SET display_badge=true,short_name='CARD',colour='#88aaff',rank=20 \
+             WHERE id=$1",
+        )
+        .bind(badge)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for user in [bare, restricted] {
+            sqlx::query("INSERT INTO user_roles(user_id,role_id) VALUES($1,$2)")
+                .bind(user)
+                .bind(badge)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        for user in [owner, restricted] {
+            sqlx::query(
+                "INSERT INTO bancho_sessions(id,user_id,token_hash,expires_at) \
+                 VALUES($1,$2,$3,now()+interval '1 hour')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(user)
+            .bind(Uuid::new_v4().simple().to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        for user in [owner, bare, restricted] {
+            let added = request(
+                &app,
+                "POST",
+                &format!("/api/v1/me/relationships/{user}"),
+                Some(&viewer_cookie),
+                json!({"relation_type":"friend"}),
+            )
+            .await;
+            assert_eq!(added.0, StatusCode::OK, "{}", added.1);
+        }
+        sqlx::query("UPDATE users SET is_restricted=true WHERE id=$1")
+            .bind(restricted)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        balance(&state.db, owner, 12345).await;
+        let title = create(&app, &manager, "Card equipped title", "title", 10).await;
+        let frame = create(&app, &manager, "Card equipped frame", "avatar_frame", 20).await;
+        let unequipped = create(&app, &manager, "Card private inventory", "title", 30).await;
+        for item in [&title, &frame, &unequipped] {
+            owned(&state.db, owner, item).await;
+        }
+        let equipped = request(
+            &app,
+            "PATCH",
+            EQUIPMENT,
+            Some(&owner_cookie),
+            json!({"title_id":title["id"],"avatar_frame_id":frame["id"]}),
+        )
+        .await;
+        assert_eq!(equipped.0, StatusCode::OK, "{}", equipped.1);
+        for item in [&title, &frame] {
+            let mut body = edit_body(item);
+            body["active"] = json!(false);
+            patch(&app, &manager, item, body).await;
+        }
+        let empty = json!({"title":null,"avatar_frame":null});
+        let mut relation = "friends";
+        for step in 0..3 {
+            if step == 1 {
+                // Blocking removes the friendship, while the existing blocks
+                // view remains allowed to display that target's public card.
+                let blocked = request(
+                    &app,
+                    "POST",
+                    &format!("/api/v1/me/relationships/{owner}"),
+                    Some(&viewer_cookie),
+                    json!({"relation_type":"block"}),
+                )
+                .await;
+                assert_eq!(blocked.0, StatusCode::OK, "{}", blocked.1);
+                relation = "blocks";
+            } else if step == 2 {
+                let unset = request(
+                    &app,
+                    "PATCH",
+                    EQUIPMENT,
+                    Some(&owner_cookie),
+                    json!({"title_id":null,"avatar_frame_id":null}),
+                )
+                .await;
+                assert_eq!(unset.0, StatusCode::OK, "{}", unset.1);
+            }
+            let before = snapshot(&state.db).await;
+            let profile = request(
+                &app,
+                "GET",
+                &format!("/api/v1/users/{owner}"),
+                None,
+                Value::Null,
+            )
+            .await;
+            assert_eq!(profile.0, StatusCode::OK, "{}", profile.1);
+            let cosmetics = &profile.1["cosmetics"];
+            if step < 2 {
+                assert_eq!(cosmetics["title"]["id"], title["id"]);
+                assert_eq!(cosmetics["avatar_frame"]["id"], frame["id"]);
+                assert_eq!(cosmetics["title"]["active"], false);
+                assert_eq!(cosmetics["avatar_frame"]["active"], false);
+            } else {
+                assert_eq!(*cosmetics, empty);
+            }
+            let online = request(&app, "GET", "/api/v1/users/online", None, Value::Null).await;
+            assert_eq!(online.0, StatusCode::OK, "{}", online.1);
+            let card = listed_card(&online.1["items"], owner);
+            assert_card_cosmetics(card, cosmetics);
+            assert_eq!(card["online"], true);
+            assert_eq!(listed_card(&card["groups"], badge)["short_name"], "CARD");
+            assert!(
+                online.1["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| { item["id"] != restricted && item["id"] != bare })
+            );
+            let groups = request(&app, "GET", "/api/v1/groups", None, Value::Null).await;
+            assert_eq!(groups.0, StatusCode::OK, "{}", groups.1);
+            let members = &listed_card(&groups.1["items"], badge)["members"];
+            assert_card_cosmetics(listed_card(members, owner), cosmetics);
+            assert_card_cosmetics(listed_card(members, bare), &empty);
+            assert!(
+                members
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["id"] != restricted)
+            );
+            let relationships = request(
+                &app,
+                "GET",
+                "/api/v1/me/relationships",
+                Some(&viewer_cookie),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(relationships.0, StatusCode::OK, "{}", relationships.1);
+            assert_card_cosmetics(
+                relationship_card(&relationships.1[relation], owner),
+                cosmetics,
+            );
+            let bare_card = relationship_card(&relationships.1["friends"], bare);
+            assert_card_cosmetics(bare_card, &empty);
+            assert_eq!(bare_card["online"], false);
+            for key in ["friends", "blocks"] {
+                assert!(relationships.1[key].as_array().unwrap().iter().all(|item| {
+                    item["target_id"] != restricted
+                        && (key == relation || item["target_id"] != owner)
+                }));
+            }
+            assert_eq!(
+                snapshot(&state.db).await,
+                before,
+                "card reads must not mutate rewards"
+            );
+        }
+        sqlx::query("UPDATE users SET is_restricted=true WHERE id=$1")
+            .bind(owner)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        for path in [
+            "/api/v1/users/online",
+            "/api/v1/groups",
+            "/api/v1/me/relationships",
+        ] {
+            let (status, value) =
+                request(&app, "GET", path, Some(&viewer_cookie), Value::Null).await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            let cards = if path == "/api/v1/groups" {
+                listed_card(&value["items"], badge)["members"]
+                    .as_array()
+                    .unwrap()
+            } else if path == "/api/v1/me/relationships" {
+                value["blocks"].as_array().unwrap()
+            } else {
+                value["items"].as_array().unwrap()
+            };
+            assert!(
+                cards
+                    .iter()
+                    .all(|card| card["id"] != owner && card["target_id"] != owner)
+            );
+        }
+    })
+    .await;
+    fixture.finish(result).await;
+}
+
 #[tokio::test]
 #[ignore = "requires ILLYA_TEST_DATABASE_URL; owned disposable PostgreSQL 17"]
 async fn rewards_http_permissions_and_input_boundaries() {

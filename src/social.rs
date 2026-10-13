@@ -27,9 +27,33 @@ pub struct Change {
     relation_type: Kind,
 }
 
-/// Player-card JSON shared by the friends list and the online list: identity, banner and
-/// the highest-ranked badge group, plus whether a game client is connected right now.
-pub const CARD: &str = "jsonb_build_object('id',u.id,'username',u.username,'avatar_url',u.avatar_url,'country',u.country,'banner_url',u.banner_url,'banner_position_x',u.banner_position_x,'banner_position_y',u.banner_position_y,'accent_color',u.accent_color,'online',u.is_bot OR EXISTS(SELECT 1 FROM bancho_sessions b WHERE b.user_id=u.id AND b.expires_at>now()) OR EXISTS(SELECT 1 FROM lazer_sessions l WHERE l.user_id=u.id AND l.access_expires_at>now() AND l.last_seen_at>now()-interval '3 minutes'),'groups',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name,'short_name',r.short_name,'colour',r.colour,'icon',r.icon) ORDER BY r.rank DESC,r.id) FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id AND r.display_badge),'[]'::jsonb))";
+/// Public cards share identity, banner, role badges, online status and equipped
+/// decorations. Catalog metadata stays in this projection, without exposing the
+/// wallet or inventory or performing another API/database query for each card.
+/// Delisted decorations remain visible while their owner has them equipped.
+pub const CARD: &str = "jsonb_build_object(\
+    'id',u.id,'username',u.username,'avatar_url',u.avatar_url,'country',u.country,\
+    'banner_url',u.banner_url,'banner_position_x',u.banner_position_x,\
+    'banner_position_y',u.banner_position_y,'accent_color',u.accent_color,\
+    'online',u.is_bot OR EXISTS(SELECT 1 FROM bancho_sessions b WHERE b.user_id=u.id AND b.expires_at>now()) \
+        OR EXISTS(SELECT 1 FROM lazer_sessions l WHERE l.user_id=u.id AND l.access_expires_at>now() \
+            AND l.last_seen_at>now()-interval '3 minutes'),\
+    'groups',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'name',r.name,\
+        'short_name',r.short_name,'colour',r.colour,'icon',r.icon) ORDER BY r.rank DESC,r.id) \
+        FROM roles r JOIN user_roles ur ON ur.role_id=r.id \
+        WHERE ur.user_id=u.id AND r.display_badge),'[]'::jsonb),\
+    'cosmetics',jsonb_build_object('title',\
+        (SELECT jsonb_build_object('id',r.id,'name',r.name,'description',r.description,\
+            'kind',r.kind,'price',r.price,'color',r.color,'style',r.style,\
+            'active',r.active,'revision',r.revision) \
+         FROM reward_equipment e JOIN reward_catalog r ON r.id=e.title_id \
+         WHERE e.user_id=u.id AND r.kind='title'),\
+        'avatar_frame',\
+        (SELECT jsonb_build_object('id',r.id,'name',r.name,'description',r.description,\
+            'kind',r.kind,'price',r.price,'color',r.color,'style',r.style,\
+            'active',r.active,'revision',r.revision) \
+         FROM reward_equipment e JOIN reward_catalog r ON r.id=e.avatar_frame_id \
+         WHERE e.user_id=u.id AND r.kind='avatar_frame')))";
 
 #[derive(Deserialize)]
 pub struct OnlineQuery {
